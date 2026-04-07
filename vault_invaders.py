@@ -425,7 +425,7 @@ class VaultApp:
             is_sel = i == self.cursor
             self.zone(row, x, 2, w, "select_entry", i)
 
-            if is_sel:
+            if is_sel and self.mode in ("list", "detail"):
                 active = self.mode == "detail"
                 sel_c = C_RED_INV if active else C_GREEN_INV
                 sel_attr = curses.color_pair(sel_c) | curses.A_BOLD
@@ -1023,10 +1023,10 @@ class VaultApp:
 
     # ── Input handlers ──────────────────────────────────────────────
     def handle_tabs_input(self, key):
-        """Tab bar is focused. ←→ switch tabs, Enter/↓ dives into content."""
-        if key == curses.KEY_LEFT:
+        """Tab bar is focused. ←→/Tab switch tabs, Enter/↓ dives into content."""
+        if key in (curses.KEY_LEFT, curses.KEY_BTAB):
             self.tab = (self.tab - 1) % len(TABS)
-        elif key == curses.KEY_RIGHT:
+        elif key in (curses.KEY_RIGHT, ord("\t")):
             self.tab = (self.tab + 1) % len(TABS)
         elif key in (ord("\n"), curses.KEY_DOWN):
             self._enter_tab()
@@ -1451,6 +1451,14 @@ class VaultApp:
                             self.cursor = min(len(its)-1, self.cursor+1) if its else 0
                 except curses.error:
                     pass
+            elif key == ord("\t") and self.mode != "form" and self.mode != "notes_editor":
+                self.tab = (self.tab + 1) % len(TABS)
+                self.mode = "tabs"
+                self.search = ""
+            elif key == curses.KEY_BTAB and self.mode != "form" and self.mode != "notes_editor":
+                self.tab = (self.tab - 1) % len(TABS)
+                self.mode = "tabs"
+                self.search = ""
             elif self.mode == "tabs":
                 result = self.handle_tabs_input(key)
             elif self.mode == "list":
