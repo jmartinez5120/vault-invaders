@@ -39,17 +39,16 @@ except ImportError:
     print("\n  ⚠  pip3 install cryptography\n")
     sys.exit(1)
 
-# Argon2id (preferred) with PBKDF2 fallback
 try:
     from argon2.low_level import hash_secret_raw, Type
-    HAS_ARGON2 = True
 except ImportError:
-    HAS_ARGON2 = False
-    print("  ℹ  pip3 install argon2-cffi  (falling back to PBKDF2)\n")
+    print("\n  ⚠  pip3 install argon2-cffi\n")
+    sys.exit(1)
 
 # ── Config file ─────────────────────────────────────────────────────────
 CONFIG_PATH = Path.home() / ".vault_invaders.conf"
 DEFAULT_VAULT = Path.home() / ".vault_invaders.enc"
+LOCKOUT_PATH = Path.home() / ".vault_invaders.lock"
 
 def load_config() -> dict:
     defaults = {"vault_path": str(DEFAULT_VAULT)}
@@ -68,6 +67,20 @@ def save_config(cfg: dict):
 def get_vault_path() -> Path:
     return Path(load_config()["vault_path"])
 
+def load_lockout() -> tuple:
+    try:
+        data = json.loads(LOCKOUT_PATH.read_text())
+        return data.get("attempts", 0), data.get("until", 0)
+    except Exception:
+        return 0, 0
+
+def save_lockout(attempts: int, until: float):
+    LOCKOUT_PATH.write_text(json.dumps({"attempts": attempts, "until": until}))
+    LOCKOUT_PATH.chmod(0o600)
+
+def clear_lockout():
+    LOCKOUT_PATH.unlink(missing_ok=True)
+
 # ── Crypto constants ────────────────────────────────────────────────────
 SALT_LEN = 32
 NONCE_GCM = 12
@@ -76,20 +89,16 @@ KEY_LEN = 32
 ARGON2_TIME = 4
 ARGON2_MEM = 256 * 1024  # 256 MB
 ARGON2_PARALLEL = 2
-PBKDF2_ITER = 800_000
 
 VAULT_VERSION = b'\x02'  # v2 = quantum-hardened
 
 # ── Quantum-Hardened Crypto ─────────────────────────────────────────────
 def derive_master_key(password: str, salt: bytes) -> bytes:
-    if HAS_ARGON2:
-        raw = hash_secret_raw(
-            secret=password.encode(), salt=salt,
-            time_cost=ARGON2_TIME, memory_cost=ARGON2_MEM,
-            parallelism=ARGON2_PARALLEL, hash_len=64, type=Type.ID,
-        )
-    else:
-        raw = hashlib.pbkdf2_hmac("sha512", password.encode(), salt, PBKDF2_ITER, dklen=64)
+    raw = hash_secret_raw(
+        secret=password.encode(), salt=salt,
+        time_cost=ARGON2_TIME, memory_cost=ARGON2_MEM,
+        parallelism=ARGON2_PARALLEL, hash_len=64, type=Type.ID,
+    )
     shake = hashlib.shake_256(salt + raw + b"vault-invaders-quantum-v2")
     return shake.digest(64)
 
@@ -206,6 +215,16 @@ INVADER_1 = [
 ]
 INVADER_SM = ["▄▀ ▀▄", "██▀██", " ▀ ▀ "]
 
+ALIEN_LOGO = [
+    "    █     █     █    ",
+    "     █   █ █   █     ",
+    "     █████████████     ",
+    "    ███ ███████ ███    ",
+    "   █████████████████   ",
+    "   █ █████████████ █   ",
+    "   █ █           █ █   ",
+    "        ██   ██        ",
+]
 LOGO = [
     "██╗   ██╗ █████╗ ██╗   ██╗██╗  ████████╗",
     "██║   ██║██╔══██╗██║   ██║██║  ╚══██╔══╝",
@@ -365,7 +384,7 @@ class VaultApp:
         if self.mode == "tabs":
             self.s(3, tx + 1, "◄ ► ENTER", curses.color_pair(C_DIM))
 
-        enc_label = " 🛡 QUANTUM " if HAS_ARGON2 else " 🔒 AES-256 "
+        enc_label = " 🛡 QUANTUM "
         self.s(3, w - len(enc_label) - 1, enc_label, curses.color_pair(C_MAGENTA))
         self.s(4, 0, "═"*w, curses.color_pair(C_DIM))
 
@@ -571,7 +590,7 @@ class VaultApp:
 
         row = y + 2
         self.s(row, x+2, "ENCRYPTION", curses.color_pair(C_DIM))
-        info = "Argon2id + AES-256-GCM + ChaCha20-Poly1305 + SHAKE-256" if HAS_ARGON2 else "PBKDF2 + AES-256-GCM + ChaCha20-Poly1305 (pip3 install argon2-cffi for quantum)"
+        info = "Argon2id + AES-256-GCM + ChaCha20-Poly1305 + SHAKE-256"
         self.s(row+1, x+4, info[:w-8], curses.color_pair(C_GREEN))
 
         row += 3
@@ -1268,32 +1287,42 @@ def login_screen(scr) -> tuple:
     vault_exists = get_vault_path().exists()
     password, confirm, field, error = "", "", 0, ""
     reset_mode, reset_input = False, ""
+    failed_attempts, lockout_until = load_lockout()
 
     while True:
         scr.erase()
         stars.draw(scr)
 
         ly = max(1, h//2 - 12)
-        for i, ln in enumerate(LOGO):
-            x = w//2 - len(ln)//2
-            if x > 0:
-                try: scr.addstr(ly+i, x, ln, curses.color_pair(C_GREEN)|curses.A_BOLD)
+        # Draw alien on the left, VAULT text on the right
+        alien_w = 24
+        logo_w = 41
+        gap = 3
+        total_w = alien_w + gap + logo_w
+        ax = w//2 - total_w//2
+        lx = ax + alien_w + gap
+
+        for i, ln in enumerate(ALIEN_LOGO):
+            if ax > 0:
+                try: scr.addstr(ly+i, ax, ln, curses.color_pair(C_GREEN)|curses.A_BOLD)
                 except curses.error: pass
 
-        ty = ly + len(LOGO) + 1
-        try: scr.addstr(ty, w//2-len(TITLE_LINE)//2, TITLE_LINE, curses.color_pair(C_GREEN))
+        logo_top = ly + 2
+        for i, ln in enumerate(LOGO):
+            if lx > 0:
+                try: scr.addstr(logo_top+i, lx, ln, curses.color_pair(C_GREEN)|curses.A_BOLD)
+                except curses.error: pass
+
+        ty = logo_top + len(LOGO)
+        try: scr.addstr(ty, lx, TITLE_LINE, curses.color_pair(C_GREEN))
         except curses.error: pass
 
-        iy = ty + 2
-        inv = "  ▄▀ ▀▄  ▄▀ ▀▄  ▄▀ ▀▄  "
-        try: scr.addstr(iy, w//2-len(inv)//2, inv, curses.color_pair(C_GREEN))
+        iy = max(ly + len(ALIEN_LOGO), ty) + 2
+        enc = "Argon2id+AES-256-GCM+ChaCha20+SHAKE-256"
+        try: scr.addstr(iy, w//2-len(enc)//2, enc, curses.color_pair(C_MAGENTA))
         except curses.error: pass
 
-        enc = "🛡 Argon2id+AES-256-GCM+ChaCha20+SHAKE-256" if HAS_ARGON2 else "🔒 AES-256-GCM+ChaCha20-Poly1305"
-        try: scr.addstr(iy+1, w//2-len(enc)//2, enc, curses.color_pair(C_MAGENTA))
-        except curses.error: pass
-
-        by = iy + 3
+        by = iy + 2
         bw = 50
         bx = w//2 - bw//2
         sub = "ENTER MASTER PASSWORD" if vault_exists else "CREATE MASTER PASSWORD"
@@ -1324,6 +1353,37 @@ def login_screen(scr) -> tuple:
         if error:
             try: scr.addstr(by+8, w//2-len(error)//2, error, curses.color_pair(C_RED)|curses.A_BOLD)
             except curses.error: pass
+
+        if failed_attempts > 0 and vault_exists:
+            now = time.time()
+            remaining = max(0, int(lockout_until - now) + 1)
+            ay = by + 9
+            if remaining > 0:
+                # Alien blockade - more aliens appear with more failures
+                alien_count = min(failed_attempts, 8)
+                alien_row = " ".join(["👾"] * alien_count)
+                try: scr.addstr(ay, w//2-len(alien_row)//2, alien_row, curses.color_pair(C_RED)|curses.A_BOLD)
+                except curses.error: pass
+                taunts = [
+                    "INTRUDER DETECTED!",
+                    "ACCESS DENIED, HUMAN!",
+                    "THE HIVE REJECTS YOU!",
+                    "ALIEN FIREWALL ENGAGED!",
+                    "RESISTANCE IS FUTILE!",
+                    "YOUR SIGNAL IS JAMMED!",
+                    "MOTHERSHIP SAYS NO!",
+                    "NICE TRY, EARTHLING!",
+                ]
+                taunt = taunts[min(failed_attempts - 1, len(taunts) - 1)]
+                try: scr.addstr(ay+1, w//2-len(taunt)//2, taunt, curses.color_pair(C_RED)|curses.A_BOLD)
+                except curses.error: pass
+                lock_msg = f"LOCKED {remaining}s  [{failed_attempts} FAILED]"
+                try: scr.addstr(ay+2, w//2-len(lock_msg)//2, lock_msg, curses.color_pair(C_RED))
+                except curses.error: pass
+            else:
+                warn = f"👾 {failed_attempts} FAILED ATTEMPTS 👾"
+                try: scr.addstr(ay, w//2-len(warn)//2, warn, curses.color_pair(C_RED))
+                except curses.error: pass
 
         try: scr.addstr(h-2, w//2-13, "[ENTER] Submit   [Q] Quit", curses.color_pair(C_DIM))
         except curses.error: pass
@@ -1375,11 +1435,20 @@ def login_screen(scr) -> tuple:
         if key == ord("\n"):
             error = ""
             if vault_exists:
+                now = time.time()
+                if now < lockout_until:
+                    remaining = int(lockout_until - now) + 1
+                    error = f"⚠ LOCKED ({remaining}s)"; continue
                 try:
                     entries = load_vault_data(password)
+                    clear_lockout()
                     return password, entries
                 except Exception:
-                    error = "⚠ WRONG PASSWORD"; password = ""
+                    failed_attempts += 1
+                    delay = min(2 ** failed_attempts, 30)
+                    lockout_until = time.time() + delay
+                    save_lockout(failed_attempts, lockout_until)
+                    error = f"⚠ WRONG PASSWORD (wait {delay}s)"; password = ""
             else:
                 if len(password) < 8: error = "⚠ MIN 8 CHARACTERS"
                 elif password != confirm: error = "⚠ PASSWORDS DON'T MATCH"

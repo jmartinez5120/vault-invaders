@@ -30,7 +30,7 @@ if [[ ! -d "$VENV_DIR" ]]; then
 fi
 
 echo "  Installing dependencies ..."
-"$VENV_DIR/bin/pip" install --quiet cryptography argon2-cffi
+"$VENV_DIR/bin/pip" install "cryptography==46.0.6" "argon2-cffi==25.1.0"
 
 # ── Install alias ──────────────────────────────────────────
 if [[ ! -f "$ZSHRC" ]]; then
