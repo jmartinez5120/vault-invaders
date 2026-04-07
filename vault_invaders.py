@@ -63,6 +63,7 @@ def load_config() -> dict:
 
 def save_config(cfg: dict):
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    CONFIG_PATH.chmod(0o600)
 
 def get_vault_path() -> Path:
     return Path(load_config()["vault_path"])
@@ -119,14 +120,19 @@ def decrypt_vault(blob: bytes, password: str) -> list:
         plaintext = AESGCM(key_aes).decrypt(nonce1, ct1, salt)
         return json.loads(plaintext.decode("utf-8"))
     else:
-        # Legacy v1 auto-migrate
+        # Legacy v1 — decrypt then auto-upgrade to v2
         salt = raw[:16]; nonce = raw[16:28]; ct = raw[28:]
         key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 600_000, dklen=32)
         pt = AESGCM(key).decrypt(nonce, ct, None)
-        return json.loads(pt.decode())
+        entries = json.loads(pt.decode())
+        # Auto-upgrade to v2 format
+        save_vault(entries, password)
+        return entries
 
 def save_vault(entries: list, password: str):
-    get_vault_path().write_bytes(encrypt_vault(entries, password))
+    vp = get_vault_path()
+    vp.write_bytes(encrypt_vault(entries, password))
+    vp.chmod(0o600)
 
 def load_vault_data(password: str) -> list:
     return decrypt_vault(get_vault_path().read_bytes(), password)
@@ -149,6 +155,25 @@ def copy_to_clipboard(text: str) -> bool:
         return True
     except Exception:
         return False
+
+def clear_clipboard_after(seconds: int = 15):
+    """Clear clipboard after a delay (runs in background thread)."""
+    import threading
+    def _clear():
+        time.sleep(seconds)
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["pbcopy"], input=b"", check=True)
+            elif sys.platform.startswith("linux"):
+                for cmd in [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"], ["wl-copy", "--clear"]]:
+                    try:
+                        subprocess.run(cmd, input=b"", check=True)
+                        return
+                    except FileNotFoundError:
+                        continue
+        except Exception:
+            pass
+    threading.Thread(target=_clear, daemon=True).start()
 
 def read_from_clipboard() -> str:
     try:
@@ -883,7 +908,12 @@ class VaultApp:
         elif key in (ord("c"), ord("C")):
             self.toast("USERNAME COPIED" if copy_to_clipboard(e.get("username","")) else "CLIPBOARD FAILED")
         elif key in (ord("p"), ord("P")):
-            self.toast("PASSWORD COPIED" if copy_to_clipboard(e.get("password","")) else "CLIPBOARD FAILED")
+            ok = copy_to_clipboard(e.get("password",""))
+            if ok:
+                clear_clipboard_after(15)
+                self.toast("PASSWORD COPIED (15s)")
+            else:
+                self.toast("CLIPBOARD FAILED")
         elif key in (ord("s"), ord("S"), ord("h"), ord("H")):
             self.show_pw = not self.show_pw
         elif key in (ord("e"), ord("E")):
@@ -1056,8 +1086,8 @@ class VaultApp:
         cur, new, conf = self.cfg_pw_fields["current"], self.cfg_pw_fields["new"], self.cfg_pw_fields["confirm"]
         if cur != self.master_pw:
             self.cfg_error = "WRONG CURRENT PASSWORD"; return
-        if len(new) < 6:
-            self.cfg_error = "MIN 6 CHARACTERS"; return
+        if len(new) < 8:
+            self.cfg_error = "MIN 8 CHARACTERS"; return
         if new != conf:
             self.cfg_error = "PASSWORDS DON'T MATCH"; return
         if new == cur:
@@ -1076,8 +1106,12 @@ class VaultApp:
         new_path = self.cfg_path_input.strip()
         if not new_path:
             self.cfg_error = "PATH CANNOT BE EMPTY"; return
-        new_path = Path(os.path.expanduser(new_path))
+        new_path = Path(os.path.expanduser(new_path)).resolve()
         old_path = get_vault_path()
+        if new_path.is_symlink():
+            self.cfg_error = "SYMLINKS NOT ALLOWED"; return
+        if new_path.parent.is_symlink():
+            self.cfg_error = "PARENT DIR IS A SYMLINK"; return
         try:
             new_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -1118,7 +1152,12 @@ class VaultApp:
                 self.toast("USERNAME COPIED" if copy_to_clipboard(items[self.cursor].get("username","")) else "CLIPBOARD FAILED")
         elif action == "copy_pass":
             if items and self.cursor < len(items):
-                self.toast("PASSWORD COPIED" if copy_to_clipboard(items[self.cursor].get("password","")) else "CLIPBOARD FAILED")
+                ok = copy_to_clipboard(items[self.cursor].get("password",""))
+                if ok:
+                    clear_clipboard_after(15)
+                    self.toast("PASSWORD COPIED (15s)")
+                else:
+                    self.toast("CLIPBOARD FAILED")
         elif action == "toggle_pw":
             self.show_pw = not self.show_pw
         elif action == "edit_entry":
@@ -1228,6 +1267,7 @@ def login_screen(scr) -> tuple:
     stars = Stars(h, w)
     vault_exists = get_vault_path().exists()
     password, confirm, field, error = "", "", 0, ""
+    reset_mode, reset_input = False, ""
 
     while True:
         scr.erase()
@@ -1288,8 +1328,19 @@ def login_screen(scr) -> tuple:
         try: scr.addstr(h-2, w//2-13, "[ENTER] Submit   [Q] Quit", curses.color_pair(C_DIM))
         except curses.error: pass
 
-        if vault_exists:
+        if vault_exists and not reset_mode:
             try: scr.addstr(h-3, w//2-8, "[R] Reset Vault", curses.color_pair(C_RED))
+            except curses.error: pass
+
+        if reset_mode:
+            ry = by + 6
+            try:
+                scr.addstr(ry, w//2-18, '⚠ TYPE "RESET" TO DESTROY VAULT ⚠', curses.color_pair(C_RED)|curses.A_BOLD)
+                scr.addstr(ry+1, w//2-10, "> " + reset_input, curses.color_pair(C_RED)|curses.A_BOLD)
+                cx = w//2-8+len(reset_input)
+                if cx < w-2:
+                    scr.addstr(ry+1, cx, "█", curses.color_pair(C_RED)|curses.A_BOLD)
+                scr.addstr(ry+2, w//2-6, "[ESC] Cancel", curses.color_pair(C_DIM))
             except curses.error: pass
 
         scr.refresh()
@@ -1303,8 +1354,23 @@ def login_screen(scr) -> tuple:
             raise SystemExit(0)
         if key in (ord("\t"), curses.KEY_DOWN, curses.KEY_UP) and not vault_exists:
             field = 1 - field; continue
-        if key in (ord("r"), ord("R")) and vault_exists and not password:
-            get_vault_path().unlink(missing_ok=True); vault_exists = False; error = "VAULT RESET"; continue
+        if key in (ord("r"), ord("R")) and vault_exists and not password and not reset_mode:
+            reset_mode = True; reset_input = ""; continue
+
+        if reset_mode:
+            if key == 27:
+                reset_mode = False; reset_input = ""; continue
+            elif key == ord("\n"):
+                if reset_input.strip().upper() == "RESET":
+                    get_vault_path().unlink(missing_ok=True); vault_exists = False
+                    reset_mode = False; reset_input = ""; error = "VAULT RESET"
+                else:
+                    reset_input = ""
+                continue
+            elif key in (127, curses.KEY_BACKSPACE, 8):
+                reset_input = reset_input[:-1]; continue
+            elif 32 <= key < 127:
+                reset_input += chr(key); continue
 
         if key == ord("\n"):
             error = ""
@@ -1315,7 +1381,7 @@ def login_screen(scr) -> tuple:
                 except Exception:
                     error = "⚠ WRONG PASSWORD"; password = ""
             else:
-                if len(password) < 6: error = "⚠ MIN 6 CHARACTERS"
+                if len(password) < 8: error = "⚠ MIN 8 CHARACTERS"
                 elif password != confirm: error = "⚠ PASSWORDS DON'T MATCH"
                 else:
                     save_vault([], password)
