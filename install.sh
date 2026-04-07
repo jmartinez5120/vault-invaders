@@ -7,9 +7,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VAULT_SCRIPT="$SCRIPT_DIR/vault_invaders.py"
+VENV_DIR="$SCRIPT_DIR/.venv"
 ZSHRC="$HOME/.zshrc"
 ALIAS_MARKER="# vault-invaders"
-ALIAS_LINE="alias invade='python3 \"$VAULT_SCRIPT\"'  $ALIAS_MARKER"
+ALIAS_LINE="alias invade='\"$VENV_DIR/bin/python3\" \"$VAULT_SCRIPT\"'  $ALIAS_MARKER"
 
 # ── Preflight checks ───────────────────────────────────────
 if [[ ! -f "$VAULT_SCRIPT" ]]; then
@@ -22,22 +23,14 @@ if ! command -v python3 &>/dev/null; then
   exit 1
 fi
 
-# Check Python dependencies
-missing=()
-python3 -c "import cryptography" 2>/dev/null || missing+=("cryptography")
-python3 -c "import argon2" 2>/dev/null || missing+=("argon2-cffi")
-
-if [[ ${#missing[@]} -gt 0 ]]; then
-  echo "  Missing Python packages: ${missing[*]}"
-  echo "  Run: pip3 install ${missing[*]}"
-  echo ""
-  read -rp "  Install them now? [y/N] " yn
-  if [[ "$yn" =~ ^[Yy]$ ]]; then
-    pip3 install "${missing[@]}"
-  else
-    echo "  Skipping. The app may not work without these."
-  fi
+# ── Create virtual environment ─────────────────────────────
+if [[ ! -d "$VENV_DIR" ]]; then
+  echo "  Creating virtual environment at $VENV_DIR ..."
+  python3 -m venv "$VENV_DIR"
 fi
+
+echo "  Installing dependencies ..."
+"$VENV_DIR/bin/pip" install --quiet cryptography argon2-cffi
 
 # ── Install alias ──────────────────────────────────────────
 if [[ ! -f "$ZSHRC" ]]; then
@@ -45,7 +38,6 @@ if [[ ! -f "$ZSHRC" ]]; then
 fi
 
 if grep -qF "$ALIAS_MARKER" "$ZSHRC"; then
-  # Update existing alias in place
   sed -i '' "/$ALIAS_MARKER/d" "$ZSHRC"
 fi
 
