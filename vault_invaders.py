@@ -303,6 +303,12 @@ class VaultApp:
         self.click_zones = []
         self._edit_id = None
         self._edit_ref = None
+        # Notes editor state
+        self.notes_lines = [""]
+        self.notes_cx = 0
+        self.notes_cy = 0
+        self.notes_scroll = 0
+        self._notes_backup = ""
         # Config state
         self.cfg_cursor = 0
         self.cfg_mode = "menu"
@@ -323,9 +329,8 @@ class VaultApp:
         self.click_zones.append((y, x, h, w, action, data))
 
     def filtered(self):
-        if not self.search:
-            return self.entries
-        return [e for e in self.entries if fuzzy_match(self.search, e.get("system","")) or fuzzy_match(self.search, e.get("username",""))]
+        items = self.entries if not self.search else [e for e in self.entries if fuzzy_match(self.search, e.get("system","")) or fuzzy_match(self.search, e.get("username",""))]
+        return sorted(items, key=lambda e: e.get("system", "").lower())
 
     def draw_box(self, y, x, h, w, color=C_GREEN):
         cp = curses.color_pair(color)
@@ -421,13 +426,23 @@ class VaultApp:
             self.zone(row, x, 2, w, "select_entry", i)
 
             if is_sel:
-                # Highlighted row: black text on green background
-                sel_attr = curses.color_pair(C_GREEN_INV) | curses.A_BOLD
+                active = self.mode == "detail"
+                sel_c = C_RED_INV if active else C_GREEN_INV
+                sel_attr = curses.color_pair(sel_c) | curses.A_BOLD
                 self.s(row, x, " " * w, sel_attr)
                 self.s(row+1, x, " " * w, sel_attr)
-                self.s(row, x, " ▸ ", sel_attr)
-                self.s(row, x+3, e.get("system","")[:w-16], sel_attr)
-                self.s(row+1, x+3, "└ " + e.get("username","")[:w-10], sel_attr)
+                if active:
+                    border_c = curses.color_pair(C_RED) | curses.A_BOLD
+                    try:
+                        self.scr.addstr(row, x, "▐", border_c)
+                        self.scr.addstr(row, x + w - 1, "▌", border_c)
+                        self.scr.addstr(row+1, x, "▐", border_c)
+                        self.scr.addstr(row+1, x + w - 1, "▌", border_c)
+                    except curses.error:
+                        pass
+                self.s(row, x+2, " ▸ ", sel_attr)
+                self.s(row, x+5, e.get("system","")[:w-18], sel_attr)
+                self.s(row+1, x+2, " └ " + e.get("username","")[:w-12], sel_attr)
             else:
                 self.s(row, x, "  ", curses.color_pair(C_DIM))
                 self.s(row, x+2, e.get("system","")[:w-16], curses.color_pair(C_GREEN))
@@ -500,6 +515,24 @@ class VaultApp:
         ]
         for label, key_name in opt_fields:
             val = e.get(key_name, "")
+            if val or key_name == "notes":
+                self.s(row, x+2, label, curses.color_pair(C_DIM))
+                if key_name == "notes":
+                    nb = "[N]otes"
+                    nx = x + w - len(nb) - 3
+                    self.s(row, nx, nb, curses.color_pair(C_CYAN))
+                    self.zone(row, nx, 1, len(nb), "open_notes")
+                if val:
+                    cw = max(1, w-8)
+                    display = val.replace("\n", " ")
+                    lines = [display[i:i+cw] for i in range(0, len(display), cw)]
+                    for li, ln in enumerate(lines[:3]):
+                        self.s(row+1+li, x+4, ln, curses.color_pair(C_GREEN))
+                    row += 1 + min(len(lines), 3) + 1
+                else:
+                    self.s(row+1, x+4, "(empty)", curses.color_pair(C_DIM))
+                    row += 3
+                continue
             if val:
                 self.s(row, x+2, label, curses.color_pair(C_DIM))
                 cw = max(1, w-8)
@@ -546,6 +579,14 @@ class VaultApp:
                     ex += 8
                 if active:
                     self.s(row, ex+2, "← → to change", curses.color_pair(C_DIM))
+            elif field == "notes":
+                val = self.form.get(field, "")
+                preview = val.replace("\n", " ")[:w-20] if val else "(empty)"
+                line_count = len(val.split("\n")) if val else 0
+                self.s(row, x+4, preview, curses.color_pair(C_GREEN) if val else curses.color_pair(C_DIM))
+                if active:
+                    hint = f"[ENTER] Edit ({line_count} lines)" if line_count > 0 else "[ENTER] Edit"
+                    self.s(row, x + w - len(hint) - 2, hint, curses.color_pair(C_CYAN))
             else:
                 val = self.form.get(field, "")
                 if field == "password" and val:
@@ -583,6 +624,126 @@ class VaultApp:
         if cx < bx+bw-2:
             self.s(by+6, cx, "█", curses.color_pair(C_RED)|curses.A_BOLD)
         self.s(by+7, bx+3, "[ESC] Cancel", curses.color_pair(C_DIM))
+
+    # ── Notes editor popup ──────────────────────────────────────────
+    def draw_notes_editor(self):
+        h, w = self.scr.getmaxyx()
+        bw = min(w - 4, max(60, int(w * 0.8)))
+        bh = min(h - 4, max(16, int(h * 0.8)))
+        bx = w // 2 - bw // 2
+        by = h // 2 - bh // 2
+        text_w = bw - 4
+        text_h = bh - 5
+
+        # Background fill
+        for row in range(by, by + bh):
+            self.s(row, bx, " " * bw, curses.color_pair(C_GREEN))
+        self.draw_box(by, bx, bh, bw, C_GREEN)
+
+        # Title
+        title = " NOTES VIEWER " if self._notes_readonly else " NOTES EDITOR "
+        self.s(by, bx + bw // 2 - len(title) // 2, title, curses.color_pair(C_GREEN) | curses.A_BOLD)
+
+        # Scroll if cursor is off screen
+        if self.notes_cy < self.notes_scroll:
+            self.notes_scroll = self.notes_cy
+        if self.notes_cy >= self.notes_scroll + text_h:
+            self.notes_scroll = self.notes_cy - text_h + 1
+
+        # Draw lines
+        for i in range(text_h):
+            li = i + self.notes_scroll
+            if li < len(self.notes_lines):
+                line = self.notes_lines[li][:text_w]
+                self.s(by + 2 + i, bx + 2, line, curses.color_pair(C_GREEN))
+
+        # Cursor (edit mode only)
+        if not self._notes_readonly:
+            cy_screen = self.notes_cy - self.notes_scroll
+            if 0 <= cy_screen < text_h:
+                cx_draw = bx + 2 + min(self.notes_cx, text_w)
+                self.s(by + 2 + cy_screen, cx_draw, "█", curses.color_pair(C_GREEN) | curses.A_BOLD)
+
+        # Line count and position
+        pos = f"Ln {self.notes_cy+1}/{len(self.notes_lines)}  Col {self.notes_cx+1}"
+        self.s(by + bh - 2, bx + 2, pos, curses.color_pair(C_DIM))
+
+        # Footer
+        if self._notes_readonly:
+            footer = "[ESC] Close"
+        else:
+            footer = "[ESC] Save   [CTRL+X] Cancel"
+        self.s(by + bh - 1, bx + bw // 2 - len(footer) // 2, footer, curses.color_pair(C_DIM))
+
+    def handle_notes_editor_input(self, key):
+        lines = self.notes_lines
+        cy, cx = self.notes_cy, self.notes_cx
+
+        if key == 27:  # ESC
+            if self._notes_readonly:
+                self._cancel_notes_editor()
+            else:
+                self._save_notes_editor()
+            return
+        if self._notes_readonly:
+            # View mode: only allow scrolling
+            if key == curses.KEY_UP and cy > 0:
+                self.notes_cy -= 1
+            elif key == curses.KEY_DOWN and cy < len(lines) - 1:
+                self.notes_cy += 1
+            elif key == curses.KEY_HOME:
+                self.notes_cy = 0
+            elif key == curses.KEY_END:
+                self.notes_cy = len(lines) - 1
+            return
+        if key == 24:  # CTRL+X — cancel
+            self._cancel_notes_editor()
+        elif key == ord("\n"):  # Enter — new line
+            rest = lines[cy][cx:]
+            lines[cy] = lines[cy][:cx]
+            lines.insert(cy + 1, rest)
+            self.notes_cy += 1
+            self.notes_cx = 0
+        elif key in (127, curses.KEY_BACKSPACE, 8):  # Backspace
+            if cx > 0:
+                lines[cy] = lines[cy][:cx-1] + lines[cy][cx:]
+                self.notes_cx -= 1
+            elif cy > 0:
+                self.notes_cx = len(lines[cy - 1])
+                lines[cy - 1] += lines.pop(cy)
+                self.notes_cy -= 1
+        elif key == curses.KEY_DC:  # Delete
+            if cx < len(lines[cy]):
+                lines[cy] = lines[cy][:cx] + lines[cy][cx+1:]
+            elif cy < len(lines) - 1:
+                lines[cy] += lines.pop(cy + 1)
+        elif key == curses.KEY_LEFT:
+            if cx > 0:
+                self.notes_cx -= 1
+            elif cy > 0:
+                self.notes_cy -= 1
+                self.notes_cx = len(lines[self.notes_cy])
+        elif key == curses.KEY_RIGHT:
+            if cx < len(lines[cy]):
+                self.notes_cx += 1
+            elif cy < len(lines) - 1:
+                self.notes_cy += 1
+                self.notes_cx = 0
+        elif key == curses.KEY_UP:
+            if cy > 0:
+                self.notes_cy -= 1
+                self.notes_cx = min(self.notes_cx, len(lines[self.notes_cy]))
+        elif key == curses.KEY_DOWN:
+            if cy < len(lines) - 1:
+                self.notes_cy += 1
+                self.notes_cx = min(self.notes_cx, len(lines[self.notes_cy]))
+        elif key == curses.KEY_HOME:
+            self.notes_cx = 0
+        elif key == curses.KEY_END:
+            self.notes_cx = len(lines[cy])
+        elif 32 <= key < 127:  # Printable char
+            lines[cy] = lines[cy][:cx] + chr(key) + lines[cy][cx:]
+            self.notes_cx += 1
 
     # ── Config screen ───────────────────────────────────────────────
     def draw_config(self, y, x, w):
@@ -855,6 +1016,8 @@ class VaultApp:
         self.draw_toast()
         if self.mode == "confirm_delete":
             self.draw_confirm()
+        if self.mode == "notes_editor":
+            self.draw_notes_editor()
         self.draw_help()
         self.scr.refresh()
 
@@ -907,10 +1070,6 @@ class VaultApp:
             if items:
                 self.mode = "detail"
                 self.show_pw = False
-        elif key in (ord("q"), ord("Q")):
-            return "quit"
-        elif key in (ord("l"), ord("L")):
-            return "lock"
         elif key in (127, curses.KEY_BACKSPACE, 8):
             self.search = self.search[:-1]; self.cursor = 0
         elif 32 <= key < 127:
@@ -941,6 +1100,8 @@ class VaultApp:
             self.confirm_input = ""; self.mode = "confirm_delete"
         elif key in (ord("x"), ord("X")):
             self._export_entry()
+        elif key in (ord("n"), ord("N")):
+            self._open_notes_editor(entry=e, readonly=True)
         elif key in (ord("b"), ord("B")):
             self.mode = "list"; self.show_pw = False
         return None
@@ -962,8 +1123,11 @@ class VaultApp:
             envs = ["DEV","TEST","PROD"]
             self.form["env"] = envs[(envs.index(self.form.get("env","DEV"))+1)%3]
         elif key == ord("\n"):
+            if field == "notes":
+                self._open_notes_editor()
+                return None
             self._save_form()
-        elif field != "env":
+        elif field != "env" and field != "notes":
             if key in (127, curses.KEY_BACKSPACE, 8):
                 self.form[field] = self.form.get(field,"")[:-1]
             elif 32 <= key < 127:
@@ -1095,6 +1259,37 @@ class VaultApp:
         self.tab = 0
         self.mode = "list"
 
+    def _open_notes_editor(self, entry=None, readonly=False):
+        self._notes_entry = entry
+        self._notes_readonly = readonly
+        if entry is not None:
+            text = entry.get("notes", "")
+            self._notes_return_mode = self.mode
+        else:
+            text = self.form.get("notes", "")
+            self._notes_return_mode = "form"
+        self._notes_backup = text
+        self.notes_lines = text.split("\n") if text else [""]
+        self.notes_cy = 0
+        self.notes_cx = 0
+        self.notes_scroll = 0
+        self.mode = "notes_editor"
+
+    def _save_notes_editor(self):
+        text = "\n".join(self.notes_lines)
+        if self._notes_entry is not None:
+            self._notes_entry["notes"] = text
+            save_vault(self.entries, self.master_pw)
+            self.toast("NOTES SAVED")
+        else:
+            self.form["notes"] = text
+        self.mode = self._notes_return_mode
+
+    def _cancel_notes_editor(self):
+        if self._notes_entry is None:
+            self.form["notes"] = self._notes_backup
+        self.mode = self._notes_return_mode
+
     def _open_change_pw(self):
         self.cfg_mode = "change_pw"
         self.cfg_pw_fields = {"current":"","new":"","confirm":""}
@@ -1179,6 +1374,9 @@ class VaultApp:
                     self.toast("CLIPBOARD FAILED")
         elif action == "toggle_pw":
             self.show_pw = not self.show_pw
+        elif action == "open_notes":
+            if items and self.cursor < len(items):
+                self._open_notes_editor(entry=items[self.cursor], readonly=True)
         elif action == "edit_entry":
             if items and self.cursor < len(items):
                 self._open_edit_form(items[self.cursor])
@@ -1267,6 +1465,8 @@ class VaultApp:
                 result = self.handle_config_input(key)
             elif self.mode == "import":
                 result = self.handle_import_input(key)
+            elif self.mode == "notes_editor":
+                self.handle_notes_editor_input(key)
 
             if result == "quit":
                 break
