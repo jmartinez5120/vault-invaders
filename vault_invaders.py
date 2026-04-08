@@ -31,6 +31,7 @@ import base64
 import subprocess
 import random
 import math
+import ctypes
 from pathlib import Path
 
 try:
@@ -44,6 +45,56 @@ try:
 except ImportError:
     print("\n  ⚠  pip3 install argon2-cffi\n")
     sys.exit(1)
+
+# ── Secure memory utilities ────────────────────────────────────────────
+def secure_zero(obj):
+    """Zero out a bytearray to prevent sensitive data lingering in RAM."""
+    if isinstance(obj, bytearray) and len(obj) > 0:
+        ctypes.memset((ctypes.c_char * len(obj)).from_buffer(obj), 0, len(obj))
+
+def secure_mlock(obj):
+    """Lock memory pages to prevent swapping to disk."""
+    if not isinstance(obj, bytearray) or len(obj) == 0:
+        return
+    try:
+        libname = "libc.dylib" if sys.platform == "darwin" else "libc.so.6"
+        libc = ctypes.CDLL(libname)
+        buf = (ctypes.c_char * len(obj)).from_buffer(obj)
+        libc.mlock(buf, len(obj))
+    except Exception:
+        pass
+
+def secure_munlock(obj):
+    """Unlock memory pages after zeroing."""
+    if not isinstance(obj, bytearray) or len(obj) == 0:
+        return
+    try:
+        libname = "libc.dylib" if sys.platform == "darwin" else "libc.so.6"
+        libc = ctypes.CDLL(libname)
+        buf = (ctypes.c_char * len(obj)).from_buffer(obj)
+        libc.munlock(buf, len(obj))
+    except Exception:
+        pass
+
+def make_session_key() -> bytearray:
+    """Generate a random 32-byte session key for fast in-memory encryption."""
+    key = bytearray(os.urandom(32))
+    secure_mlock(key)
+    return key
+
+def encrypt_entry_fast(entry: dict, session_key: bytes) -> bytes:
+    """Encrypt a single entry with AES-256-GCM using the session key (no KDF)."""
+    nonce = os.urandom(12)
+    plaintext = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+    ct = AESGCM(bytes(session_key)).encrypt(nonce, plaintext, None)
+    return nonce + ct
+
+def decrypt_entry_fast(blob: bytes, session_key: bytes) -> dict:
+    """Decrypt a single entry with AES-256-GCM using the session key (no KDF)."""
+    nonce = blob[:12]
+    ct = blob[12:]
+    plaintext = AESGCM(bytes(session_key)).decrypt(nonce, ct, None)
+    return json.loads(plaintext.decode("utf-8"))
 
 # ── Config file ─────────────────────────────────────────────────────────
 CONFIG_PATH = Path.home() / ".vault_invaders.conf"
@@ -284,7 +335,10 @@ TABS = ["⌕ Credentials", "+ Add New", "📥 Import", "⚙ Config"]
 class VaultApp:
     def __init__(self, scr):
         self.scr = scr
-        self.entries = []
+        self.entries = []           # NOT used for storage anymore — see _encrypted_entries
+        self._encrypted_entries = [] # list of encrypted bytearray blobs (one per entry)
+        self._entry_index = []       # list of {system, username, env} for display
+        self._master_pw_buf = bytearray()  # mlock'd master password buffer
         self.master_pw = ""
         self.search = ""
         self.cursor = 0
@@ -292,7 +346,7 @@ class VaultApp:
         self.tab = 0
         self.mode = "list"
         self.last_activity = time.time()
-        self.inactivity_timeout = 120  # 2 minutes
+        self.inactivity_timeout = load_config().get("auto_lock", 120)
         self.toast_msg = ""
         self.toast_time = 0
         self.show_pw = False
@@ -303,8 +357,7 @@ class VaultApp:
         self.detail_cursor = 0
         self.confirm_input = ""
         self.click_zones = []
-        self._edit_id = None
-        self._edit_ref = None
+        self._edit_idx = None
         # Notes editor state
         self.notes_lines = [""]
         self.notes_cx = 0
@@ -330,6 +383,101 @@ class VaultApp:
         self.import_error = ""
         self.import_preview = None
 
+    # ── Secure entry management ─────────────────────────────────────
+    def _init_secure_storage(self, entries, master_pw):
+        """Initialize encrypted per-entry storage from plaintext entries."""
+        self.master_pw = master_pw
+        self._master_pw_buf = bytearray(master_pw.encode("utf-8"))
+        secure_mlock(self._master_pw_buf)
+        self._session_key = make_session_key()
+        self._encrypted_entries = []
+        self._entry_index = []
+        for e in entries:
+            blob = bytearray(encrypt_entry_fast(e, self._session_key))
+            self._encrypted_entries.append(blob)
+            self._entry_index.append({
+                "system": e.get("system", ""),
+                "username": e.get("username", ""),
+                "env": e.get("env", "DEV"),
+            })
+        self.entries = []  # clear plaintext
+
+    def _decrypt_entry(self, idx):
+        """Decrypt a single entry on demand (fast — no KDF)."""
+        if 0 <= idx < len(self._encrypted_entries):
+            return decrypt_entry_fast(bytes(self._encrypted_entries[idx]), self._session_key)
+        return {}
+
+    def _encrypt_and_store(self, idx, entry):
+        """Re-encrypt an entry and update the index."""
+        blob = bytearray(encrypt_entry_fast(entry, self._session_key))
+        if idx < len(self._encrypted_entries):
+            secure_zero(self._encrypted_entries[idx])
+            self._encrypted_entries[idx] = blob
+            self._entry_index[idx] = {
+                "system": entry.get("system", ""),
+                "username": entry.get("username", ""),
+                "env": entry.get("env", "DEV"),
+            }
+        else:
+            self._encrypted_entries.append(blob)
+            self._entry_index.append({
+                "system": entry.get("system", ""),
+                "username": entry.get("username", ""),
+                "env": entry.get("env", "DEV"),
+            })
+
+    def _add_secure_entry(self, entry):
+        """Encrypt and add a new entry."""
+        self._encrypt_and_store(len(self._encrypted_entries), entry)
+
+    def _delete_secure_entry(self, idx):
+        """Remove an entry, zeroing its encrypted blob."""
+        if 0 <= idx < len(self._encrypted_entries):
+            secure_zero(self._encrypted_entries[idx])
+            self._encrypted_entries.pop(idx)
+            self._entry_index.pop(idx)
+
+    def _decrypt_all(self):
+        """Decrypt all entries (for save_vault, export). Returns list of dicts."""
+        return [self._decrypt_entry(i) for i in range(len(self._encrypted_entries))]
+
+    def _save_vault_from_secure(self):
+        """Decrypt all, save to disk, entries stay encrypted in memory."""
+        all_entries = self._decrypt_all()
+        save_vault(all_entries, self.master_pw)
+
+    def _rebuild_secure_storage(self):
+        """Reload vault from disk into secure storage."""
+        entries = load_vault_data(self.master_pw)
+        self._init_secure_storage(entries, self.master_pw)
+
+    def _secure_cleanup(self):
+        """Zero all sensitive data from memory on lock/quit."""
+        # Zero session key
+        if hasattr(self, '_session_key'):
+            secure_zero(self._session_key)
+            secure_munlock(self._session_key)
+            self._session_key = bytearray()
+        # Zero master password
+        secure_zero(self._master_pw_buf)
+        secure_munlock(self._master_pw_buf)
+        self._master_pw_buf = bytearray()
+        self.master_pw = ""
+        # Zero all encrypted entry blobs
+        for blob in self._encrypted_entries:
+            secure_zero(blob)
+        self._encrypted_entries.clear()
+        self._entry_index.clear()
+        self.entries.clear()
+        # Zero form/notes/config sensitive data
+        self.form = {}
+        self.cfg_pw_fields = {"current": "", "new": "", "confirm": ""}
+        self.cfg_export_fields = {"password": "", "confirm": ""}
+        self.cfg_import_fields = {"path": "", "password": ""}
+        self.cfg_erase_pw = ""
+        self.confirm_input = ""
+
     def toast(self, msg):
         self.toast_msg = msg
         self.toast_time = time.time()
@@ -338,8 +486,11 @@ class VaultApp:
         self.click_zones.append((y, x, h, w, action, data))
 
     def filtered(self):
-        items = self.entries if not self.search else [e for e in self.entries if fuzzy_match(self.search, e.get("system","")) or fuzzy_match(self.search, e.get("username",""))]
-        return sorted(items, key=lambda e: e.get("system", "").lower())
+        """Returns list of (original_index, index_dict) tuples, sorted alphabetically."""
+        indexed = list(enumerate(self._entry_index))
+        if self.search:
+            indexed = [(i, e) for i, e in indexed if fuzzy_match(self.search, e.get("system","")) or fuzzy_match(self.search, e.get("username",""))]
+        return sorted(indexed, key=lambda x: x[1].get("system", "").lower())
 
     def draw_box(self, y, x, h, w, color=C_GREEN):
         cp = curses.color_pair(color)
@@ -370,7 +521,7 @@ class VaultApp:
         self.s(0, 0, "─"*w, curses.color_pair(C_DIM))
         self.s(1, 2, "👾", cp)
         self.s(1, 5, " VAULT INVADERS ", cp)
-        count = f" {len(self.entries)} entries "
+        count = f" {len(self._entry_index)} entries "
         self.s(1, w - len(count) - 16, count, curses.color_pair(C_DIM))
         # Inactivity countdown
         remaining = max(0, int(self.inactivity_timeout - (time.time() - self.last_activity)))
@@ -432,7 +583,7 @@ class VaultApp:
     def draw_list(self, y, x, w, max_h):
         items = self.filtered()
         if not items:
-            msg = "NO ENTRIES" if not self.entries else "NO MATCH"
+            msg = "NO ENTRIES" if not self._entry_index else "NO MATCH"
             self.s(y+2, x + w//2 - len(msg)//2, msg, curses.color_pair(C_DIM))
             return
 
@@ -443,7 +594,7 @@ class VaultApp:
             self.scroll = self.cursor
 
         for i in range(self.scroll, min(len(items), self.scroll + visible)):
-            e = items[i]
+            _oidx, e = items[i]
             row = y + (i - self.scroll) * 2
             is_sel = i == self.cursor
             self.zone(row, x, 2, w, "select_entry", i)
@@ -489,7 +640,8 @@ class VaultApp:
             self.s(y+10, x + w//2 - 8, "SELECT AN ENTRY", curses.color_pair(C_DIM))
             return
 
-        e = items[self.cursor]
+        orig_idx, _idx_data = items[self.cursor]
+        e = self._decrypt_entry(orig_idx)
         env = e.get("env", "DEV")
         env_c = {"DEV": C_GREEN_INV, "TEST": C_YELLOW_INV, "PROD": C_RED_INV}
         env_t = {"DEV": C_GREEN, "TEST": C_YELLOW, "PROD": C_RED}
@@ -576,7 +728,7 @@ class VaultApp:
 
     # ── Add/Edit form ───────────────────────────────────────────────
     def draw_form(self, y, x, w):
-        title = "EDIT ENTRY" if self._edit_id is not None else "✦ ADD NEW CREDENTIALS ✦"
+        title = "EDIT ENTRY" if self._edit_idx is not None else "✦ ADD NEW CREDENTIALS ✦"
         for i, ln in enumerate(INVADER_SM):
             self.s(y+i, x + w//2 - len(ln)//2, ln, curses.color_pair(C_CYAN))
         self.s(y+3, x + w//2 - len(title)//2, title, curses.color_pair(C_CYAN)|curses.A_BOLD)
@@ -632,7 +784,7 @@ class VaultApp:
     def draw_confirm(self):
         h, w = self.scr.getmaxyx()
         items = self.filtered()
-        name = items[self.cursor].get("system","?") if items and self.cursor < len(items) else "?"
+        name = items[self.cursor][1].get("system","?") if items and self.cursor < len(items) else "?"
         bw = max(44, len(name)+12)
         bh = 9
         bx, by = w//2 - bw//2, h//2 - bh//2
@@ -790,7 +942,7 @@ class VaultApp:
         row += 3
         self.s(row, x+2, "ENTRIES", curses.color_pair(C_DIM))
         sz = get_vault_path().stat().st_size if get_vault_path().exists() else 0
-        self.s(row+1, x+4, f"{len(self.entries)} credentials   ({sz:,} bytes on disk)", curses.color_pair(C_GREEN))
+        self.s(row+1, x+4, f"{len(self._entry_index)} credentials   ({sz:,} bytes on disk)", curses.color_pair(C_GREEN))
 
         row += 3
         self.s(row, x+2, "─"*(w-6), curses.color_pair(C_DIM))
@@ -803,6 +955,7 @@ class VaultApp:
                 ("3","Export All Credentials","export"),
                 ("4","Import Credentials File","import_file"),
                 ("5","Erase All Credentials","erase_all"),
+                ("6","Auto-Lock Timer","auto_lock"),
             ]
             for oi, (num, label, act) in enumerate(opts):
                 sel = oi == self.cfg_cursor
@@ -981,13 +1134,38 @@ class VaultApp:
             if cx < x+w-2:
                 self.s(row, cx, "█", curses.color_pair(C_RED)|curses.A_BOLD)
             row += 2
-            count = len(self.entries)
+            count = len(self._entry_index)
             self.s(row, x+4, f"This will destroy {count} credential{'s' if count != 1 else ''}.", curses.color_pair(C_RED))
             row += 2
             self.s(row, x+4, "[ENTER] Erase Everything", curses.color_pair(C_RED)|curses.A_BOLD)
             self.s(row, x+32, "[ESC] Cancel", curses.color_pair(C_DIM))
             if self.cfg_error:
                 self.s(row+2, x+4, f"⚠ {self.cfg_error}", curses.color_pair(C_RED)|curses.A_BOLD)
+
+        elif self.cfg_mode == "auto_lock":
+            self.s(row, x+2, "AUTO-LOCK TIMER", curses.color_pair(C_YELLOW)|curses.A_BOLD)
+            row += 2
+            self.s(row, x+4, "Lock the vault after inactivity:", curses.color_pair(C_DIM))
+            row += 2
+            options = [("2 MIN", 120), ("5 MIN", 300), ("15 MIN", 900)]
+            ox = x + 4
+            for label, val in options:
+                is_sel = self.inactivity_timeout == val
+                if is_sel:
+                    attr = curses.color_pair(C_GREEN_INV) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(C_DIM)
+                padded = f" {label} "
+                self.s(row, ox, padded, attr)
+                self.zone(row, ox, 1, len(padded), "set_auto_lock", val)
+                ox += len(padded) + 3
+            row += 2
+            mins = self.inactivity_timeout // 60
+            self.s(row, x+4, f"Current: {mins} minute{'s' if mins != 1 else ''}", curses.color_pair(C_GREEN))
+            row += 2
+            self.s(row, x+4, "[←→] Change", curses.color_pair(C_CYAN))
+            self.s(row, x+20, "[ENTER] Save", curses.color_pair(C_CYAN)|curses.A_BOLD)
+            self.s(row, x+36, "[ESC] Cancel", curses.color_pair(C_DIM))
 
     # ── Import screen ─────────────────────────────────────────────
     def draw_import(self, y, x, w):
@@ -1079,8 +1257,8 @@ class VaultApp:
 
     def _confirm_import(self):
         if self.import_preview:
-            self.entries.append(dict(self.import_preview))
-            save_vault(self.entries, self.master_pw)
+            self._add_secure_entry(dict(self.import_preview))
+            self._save_vault_from_secure()
             self.toast("CREDENTIAL IMPORTED")
             self.import_preview = None
             self.import_error = ""
@@ -1090,7 +1268,8 @@ class VaultApp:
     def _export_entry(self):
         items = self.filtered()
         if items and self.cursor < len(items):
-            e = items[self.cursor]
+            orig_idx, _ = items[self.cursor]
+            e = self._decrypt_entry(orig_idx)
             export = {}
             for field in self.form_fields:
                 val = e.get(field, "")
@@ -1247,7 +1426,8 @@ class VaultApp:
         items = self.filtered()
         if not items or self.cursor >= len(items):
             self.mode = "list"; return None
-        e = items[self.cursor]
+        orig_idx, _ = items[self.cursor]
+        e = self._decrypt_entry(orig_idx)
         if key == 27:
             self.mode = "list"; self.show_pw = False
         elif key in (ord("c"), ord("C")):
@@ -1262,7 +1442,7 @@ class VaultApp:
         elif key in (ord("s"), ord("S"), ord("h"), ord("H")):
             self.show_pw = not self.show_pw
         elif key in (ord("e"), ord("E")):
-            self._open_edit_form(e)
+            self._open_edit_form(e, orig_idx)
         elif key in (ord("d"), ord("D")):
             self.confirm_input = ""; self.mode = "confirm_delete"
         elif key in (ord("x"), ord("X")):
@@ -1270,7 +1450,7 @@ class VaultApp:
         elif key in (ord("w"), ord("W")):
             self._open_duplicate_form(e)
         elif key in (ord("n"), ord("N")):
-            self._open_notes_editor(entry=e, readonly=True)
+            self._open_notes_editor(entry=e, readonly=True, orig_idx=orig_idx)
         elif key in (ord("b"), ord("B")):
             self.mode = "list"; self.show_pw = False
         return None
@@ -1310,11 +1490,9 @@ class VaultApp:
             if self.confirm_input.strip().lower() == "delete":
                 items = self.filtered()
                 if items and self.cursor < len(items):
-                    e = items[self.cursor]
-                    for ri, re_ in enumerate(self.entries):
-                        if re_ is e:
-                            self.entries.pop(ri); break
-                    save_vault(self.entries, self.master_pw)
+                    orig_idx, _ = items[self.cursor]
+                    self._delete_secure_entry(orig_idx)
+                    self._save_vault_from_secure()
                     self.cursor = max(0, self.cursor-1)
                     self.toast("ENTRY DESTROYED")
                 self.mode = "list"; self.show_pw = False
@@ -1332,9 +1510,9 @@ class VaultApp:
             if key == curses.KEY_UP:
                 self.cfg_cursor = max(0, self.cfg_cursor-1)
             elif key == curses.KEY_DOWN:
-                self.cfg_cursor = min(4, self.cfg_cursor+1)
+                self.cfg_cursor = min(5, self.cfg_cursor+1)
             elif key == ord("\n"):
-                [self._open_change_pw, self._open_change_path, self._open_export, self._open_import_file, self._open_erase_all][self.cfg_cursor]()
+                [self._open_change_pw, self._open_change_path, self._open_export, self._open_import_file, self._open_erase_all, self._open_auto_lock][self.cfg_cursor]()
             elif key == 27:
                 self.mode = "tabs"
             elif key in (ord("q"), ord("Q")):
@@ -1380,6 +1558,22 @@ class VaultApp:
                     self.cfg_export_fields[pk] = self.cfg_export_fields[pk][:-1]
                 elif 32 <= key < 127:
                     self.cfg_export_fields[pk] += chr(key)
+        elif self.cfg_mode == "auto_lock":
+            if key == 27:
+                self.cfg_mode = "menu"
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                opts = [120, 300, 900]
+                try:
+                    ci = opts.index(self.inactivity_timeout)
+                except ValueError:
+                    ci = 0
+                if key == curses.KEY_RIGHT:
+                    ci = min(len(opts)-1, ci+1)
+                else:
+                    ci = max(0, ci-1)
+                self.inactivity_timeout = opts[ci]
+            elif key == ord("\n"):
+                self._apply_auto_lock()
         elif self.cfg_mode == "erase_all":
             if key == 27:
                 self.cfg_mode = "menu"; self.cfg_error = ""
@@ -1435,52 +1629,52 @@ class VaultApp:
     def _refresh_vault(self):
         """Re-read vault from disk."""
         try:
-            self.entries = load_vault_data(self.master_pw)
-            self.cursor = min(self.cursor, max(0, len(self.entries)-1))
+            self._rebuild_secure_storage()
+            self.cursor = min(self.cursor, max(0, len(self._entry_index)-1))
             self.toast("VAULT RELOADED")
         except Exception as e:
             self.toast(f"RELOAD FAILED: {e}"[:40])
 
     def _open_add_form(self):
         self.form = {"system":"","username":"","password":"","hostname":"","port":"","url":"","description":"","notes":"","env":"DEV"}
-        self.form_field = 0; self._edit_id = None; self._edit_ref = None
+        self.form_field = 0; self._edit_idx = None
         self.mode = "form"; self.tab = 1
 
-    def _open_edit_form(self, entry):
+    def _open_edit_form(self, entry, orig_idx=None):
         self.form = {k: entry.get(k,"") for k in self.form_fields}
-        self.form_field = 0; self._edit_id = id(entry); self._edit_ref = entry
+        self.form_field = 0; self._edit_idx = orig_idx
         self.mode = "form"
 
     def _open_duplicate_form(self, entry):
         self.form = {k: entry.get(k,"") for k in self.form_fields}
         self.form["notes"] = ""  # notes are never duplicated
-        self.form_field = 0; self._edit_id = None; self._edit_ref = None
+        self.form_field = 0; self._edit_idx = None
         self.mode = "form"; self.tab = 1
 
     def _close_form(self):
-        self._edit_id = None; self._edit_ref = None
+        self._edit_idx = None
         self.tab = 0
         self.mode = "list"
 
     def _save_form(self):
         if not self.form.get("system") or not self.form.get("username") or not self.form.get("password"):
             self.toast("FILL REQUIRED FIELDS"); return
-        if self._edit_id is not None and self._edit_ref is not None:
-            for ri, re_ in enumerate(self.entries):
-                if re_ is self._edit_ref:
-                    self.entries[ri] = dict(self.form); break
+        entry = dict(self.form)
+        if self._edit_idx is not None:
+            self._encrypt_and_store(self._edit_idx, entry)
             self.toast("ENTRY UPDATED")
         else:
-            self.entries.append(dict(self.form))
+            self._add_secure_entry(entry)
             self.toast("ENTRY ADDED")
-        save_vault(self.entries, self.master_pw)
-        self._edit_id = None; self._edit_ref = None
+        self._save_vault_from_secure()
+        self._edit_idx = None
         self.tab = 0
         self.mode = "list"
 
-    def _open_notes_editor(self, entry=None, readonly=False):
+    def _open_notes_editor(self, entry=None, readonly=False, orig_idx=None):
         self._notes_entry = entry
         self._notes_readonly = readonly
+        self._notes_orig_idx = orig_idx
         if entry is not None:
             text = entry.get("notes", "")
             self._notes_return_mode = self.mode
@@ -1496,9 +1690,10 @@ class VaultApp:
 
     def _save_notes_editor(self):
         text = "\n".join(self.notes_lines)
-        if self._notes_entry is not None:
+        if self._notes_entry is not None and self._notes_orig_idx is not None:
             self._notes_entry["notes"] = text
-            save_vault(self.entries, self.master_pw)
+            self._encrypt_and_store(self._notes_orig_idx, self._notes_entry)
+            self._save_vault_from_secure()
             self.toast("NOTES SAVED")
         else:
             self.form["notes"] = text
@@ -1525,8 +1720,13 @@ class VaultApp:
             self.cfg_error = "PASSWORDS DON'T MATCH"; return
         if new == cur:
             self.cfg_error = "SAME AS CURRENT"; return
+        all_entries = self._decrypt_all()
         self.master_pw = new
-        save_vault(self.entries, self.master_pw)
+        secure_zero(self._master_pw_buf)
+        self._master_pw_buf = bytearray(new.encode("utf-8"))
+        secure_mlock(self._master_pw_buf)
+        save_vault(all_entries, self.master_pw)
+        self._rebuild_secure_storage()
         self.cfg_mode = "menu"
         self.toast("PASSWORD CHANGED")
 
@@ -1559,6 +1759,18 @@ class VaultApp:
         self.cfg_mode = "menu"
         self.toast("VAULT RELOCATED")
 
+    def _open_auto_lock(self):
+        self.cfg_mode = "auto_lock"
+
+    def _apply_auto_lock(self):
+        cfg = load_config()
+        cfg["auto_lock"] = self.inactivity_timeout
+        save_config(cfg)
+        self.last_activity = time.time()
+        self.cfg_mode = "menu"
+        mins = self.inactivity_timeout // 60
+        self.toast(f"AUTO-LOCK SET TO {mins} MIN")
+
     def _open_erase_all(self):
         self.cfg_mode = "erase_all"
         self.cfg_erase_pw = ""
@@ -1569,9 +1781,12 @@ class VaultApp:
             self.cfg_error = "ENTER YOUR MASTER PASSWORD"; return
         if self.cfg_erase_pw != self.master_pw:
             self.cfg_error = "WRONG MASTER PASSWORD"; return
-        count = len(self.entries)
-        self.entries.clear()
-        save_vault(self.entries, self.master_pw)
+        count = len(self._entry_index)
+        for blob in self._encrypted_entries:
+            secure_zero(blob)
+        self._encrypted_entries.clear()
+        self._entry_index.clear()
+        save_vault([], self.master_pw)
         self.cfg_erase_pw = ""
         self.cfg_mode = "menu"
         self.cfg_error = ""
@@ -1592,14 +1807,15 @@ class VaultApp:
             self.cfg_error = "MIN 8 CHARACTERS"; return
         if pw != confirm:
             self.cfg_error = "PASSWORDS DON'T MATCH"; return
-        if not self.entries:
+        if not self._encrypted_entries:
             self.cfg_error = "NO CREDENTIALS TO EXPORT"; return
         try:
-            encrypted = encrypt_vault(self.entries, pw)
+            all_entries = self._decrypt_all()
+            encrypted = encrypt_vault(all_entries, pw)
             out_path = Path.home() / "vault-invaders-export.enc"
             out_path.write_bytes(b"VAULTEXP" + encrypted)
             out_path.chmod(0o600)
-            count = len(self.entries)
+            count = len(all_entries)
             self.cfg_mode = "menu"
             self.cfg_error = ""
             self.toast(f"EXPORTED {count} CREDENTIALS")
@@ -1641,8 +1857,9 @@ class VaultApp:
     def _confirm_import_file(self):
         if self.cfg_import_preview:
             count = len(self.cfg_import_preview)
-            self.entries.extend(self.cfg_import_preview)
-            save_vault(self.entries, self.master_pw)
+            for entry in self.cfg_import_preview:
+                self._add_secure_entry(entry)
+            self._save_vault_from_secure()
             self.cfg_import_preview = None
             self.cfg_mode = "menu"
             self.cfg_error = ""
@@ -1671,10 +1888,14 @@ class VaultApp:
             self.tab = 0; self.mode = "list"
         elif action == "copy_user":
             if items and self.cursor < len(items):
-                self.toast("USERNAME COPIED" if copy_to_clipboard(items[self.cursor].get("username","")) else "CLIPBOARD FAILED")
+                oidx, _ = items[self.cursor]
+                de = self._decrypt_entry(oidx)
+                self.toast("USERNAME COPIED" if copy_to_clipboard(de.get("username","")) else "CLIPBOARD FAILED")
         elif action == "copy_pass":
             if items and self.cursor < len(items):
-                ok = copy_to_clipboard(items[self.cursor].get("password",""))
+                oidx, _ = items[self.cursor]
+                de = self._decrypt_entry(oidx)
+                ok = copy_to_clipboard(de.get("password",""))
                 if ok:
                     clear_clipboard_after(15)
                     self.toast("PASSWORD COPIED (15s)")
@@ -1684,13 +1905,19 @@ class VaultApp:
             self.show_pw = not self.show_pw
         elif action == "open_notes":
             if items and self.cursor < len(items):
-                self._open_notes_editor(entry=items[self.cursor], readonly=True)
+                oidx, _ = items[self.cursor]
+                de = self._decrypt_entry(oidx)
+                self._open_notes_editor(entry=de, readonly=True, orig_idx=oidx)
         elif action == "edit_entry":
             if items and self.cursor < len(items):
-                self._open_edit_form(items[self.cursor])
+                oidx, _ = items[self.cursor]
+                de = self._decrypt_entry(oidx)
+                self._open_edit_form(de, oidx)
         elif action == "dup_entry":
             if items and self.cursor < len(items):
-                self._open_duplicate_form(items[self.cursor])
+                oidx, _ = items[self.cursor]
+                de = self._decrypt_entry(oidx)
+                self._open_duplicate_form(de)
         elif action == "delete_entry":
             if items and self.cursor < len(items):
                 self.confirm_input = ""; self.mode = "confirm_delete"
@@ -1714,6 +1941,10 @@ class VaultApp:
             self._open_import_file()
         elif action == "erase_all":
             self._open_erase_all()
+        elif action == "auto_lock":
+            self._open_auto_lock()
+        elif action == "set_auto_lock":
+            self.inactivity_timeout = data
         elif action == "cfg_pw_field":
             self.cfg_pw_field = data
         elif action == "cfg_pw_save":
@@ -2006,9 +2237,9 @@ def main(scr):
         except SystemExit:
             return
         app = VaultApp(scr)
-        app.entries = entries
-        app.master_pw = master_pw
+        app._init_secure_storage(entries, master_pw)
         result = app.run()
+        app._secure_cleanup()
         if result == "lock":
             continue
         else:
