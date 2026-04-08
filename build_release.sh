@@ -21,6 +21,7 @@ cp "$SCRIPT_DIR/install.sh"        "$DIST/$NAME/"
 cp "$SCRIPT_DIR/LICENSE"           "$DIST/$NAME/"
 cp "$SCRIPT_DIR/README.md"        "$DIST/$NAME/"
 cp "$SCRIPT_DIR/VERSION"          "$DIST/$NAME/"
+cp "$SCRIPT_DIR/vault_invaders.icns" "$DIST/$NAME/" 2>/dev/null || true
 
 # Create zip
 (cd "$DIST" && zip -rq "$ARCHIVE" "$NAME")

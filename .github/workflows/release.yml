@@ -22,7 +22,7 @@ jobs:
         run: |
           NAME="vault-invaders-${{ steps.version.outputs.version }}"
           mkdir -p dist/$NAME
-          cp vault_invaders.py install.sh LICENSE README.md VERSION dist/$NAME/
+          cp vault_invaders.py install.sh LICENSE README.md VERSION vault_invaders.icns dist/$NAME/
           cd dist
           zip -r "$NAME.zip" "$NAME"
           sha256sum "$NAME.zip" > "$NAME.zip.sha256"

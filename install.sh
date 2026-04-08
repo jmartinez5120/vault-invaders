@@ -48,6 +48,36 @@ echo ""
 echo "  Done! Added to $ZSHRC:"
 echo "    $ALIAS_LINE"
 echo ""
+
+# ── Desktop shortcut ─────────────────────────────────────
+read -rp "  Create a Desktop shortcut? [y/N] " create_shortcut
+if [[ "$create_shortcut" =~ ^[Yy]$ ]]; then
+  DESKTOP="$HOME/Desktop"
+  APP_NAME="Vault Invaders.command"
+  SHORTCUT="$DESKTOP/$APP_NAME"
+
+  cat > "$SHORTCUT" <<SHORTCUTEOF
+#!/bin/bash
+"$VENV_DIR/bin/python3" "$VAULT_SCRIPT"
+SHORTCUTEOF
+  chmod +x "$SHORTCUT"
+
+  # Apply icon if .icns exists
+  ICON="$SCRIPT_DIR/vault_invaders.icns"
+  if [[ -f "$ICON" ]]; then
+    # Set custom icon via AppleScript + Finder
+    osascript -e "
+      use framework \"AppKit\"
+      set iconImage to (current application's NSImage's alloc()'s initWithContentsOfFile:\"$ICON\")
+      (current application's NSWorkspace's sharedWorkspace()'s setIcon:iconImage forFile:\"$SHORTCUT\" options:0)
+    " 2>/dev/null && echo "  Icon applied."
+  fi
+
+  echo "  Created: $SHORTCUT"
+  echo "  Double-click it to launch Vault Invaders."
+  echo ""
+fi
+
 echo "  Run 'source ~/.zshrc' or open a new terminal, then type:"
 echo "    invade"
 echo ""

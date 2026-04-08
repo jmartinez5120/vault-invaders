@@ -291,6 +291,8 @@ class VaultApp:
         self.scroll = 0
         self.tab = 0
         self.mode = "list"
+        self.last_activity = time.time()
+        self.inactivity_timeout = 120  # 2 minutes
         self.toast_msg = ""
         self.toast_time = 0
         self.show_pw = False
@@ -316,6 +318,13 @@ class VaultApp:
         self.cfg_pw_field = 0
         self.cfg_path_input = ""
         self.cfg_error = ""
+        # Export/Import file state
+        self.cfg_export_fields = {"password": "", "confirm": ""}
+        self.cfg_export_field = 0
+        self.cfg_import_fields = {"path": str(Path.home() / "vault-invaders-export.enc"), "password": ""}
+        self.cfg_import_field = 0
+        self.cfg_import_preview = None
+        self.cfg_erase_pw = ""
         # Import state
         self.import_buffer = ""
         self.import_error = ""
@@ -363,6 +372,20 @@ class VaultApp:
         self.s(1, 5, " VAULT INVADERS ", cp)
         count = f" {len(self.entries)} entries "
         self.s(1, w - len(count) - 16, count, curses.color_pair(C_DIM))
+        # Inactivity countdown
+        remaining = max(0, int(self.inactivity_timeout - (time.time() - self.last_activity)))
+        mins, secs = divmod(remaining, 60)
+        timer_str = f" {mins}:{secs:02d} "
+        if remaining <= 5:
+            timer_attr = curses.color_pair(C_RED) | curses.A_BOLD | curses.A_BLINK
+        elif remaining <= 15:
+            timer_attr = curses.color_pair(C_RED) | curses.A_BOLD
+        elif remaining <= 30:
+            timer_attr = curses.color_pair(C_YELLOW)
+        else:
+            timer_attr = curses.color_pair(C_DIM)
+        self.s(0, w - len(timer_str), timer_str, timer_attr)
+
         self.s(1, w - 15, "[R]EFRESH", curses.color_pair(C_CYAN))
         self.zone(1, w-15, 1, 9, "refresh")
         self.s(1, w - 5, "[L]CK", curses.color_pair(C_RED))
@@ -545,7 +568,7 @@ class VaultApp:
         self.s(row, x+2, "─"*(w-6), curses.color_pair(C_DIM))
         row += 1
         ox = x + 4
-        for act, aid in [("[E]dit","edit_entry"), ("[X]port","export_entry"), ("[D]elete","delete_entry"), ("[B]ack","back")]:
+        for act, aid in [("[E]dit","edit_entry"), ("[W] Dup","dup_entry"), ("[X]port","export_entry"), ("[D]elete","delete_entry"), ("[B]ack","back")]:
             c = C_RED if "Delete" in act else C_CYAN if "port" in act else C_GREEN
             self.s(row, ox, act, curses.color_pair(c))
             self.zone(row, ox, 1, len(act), aid)
@@ -670,7 +693,7 @@ class VaultApp:
 
         # Footer
         if self._notes_readonly:
-            footer = "[ESC] Close"
+            footer = "[C] Copy   [ESC] Close"
         else:
             footer = "[ESC] Save   [CTRL+X] Cancel"
         self.s(by + bh - 1, bx + bw // 2 - len(footer) // 2, footer, curses.color_pair(C_DIM))
@@ -686,8 +709,14 @@ class VaultApp:
                 self._save_notes_editor()
             return
         if self._notes_readonly:
-            # View mode: only allow scrolling
-            if key == curses.KEY_UP and cy > 0:
+            # View mode: scrolling and copy
+            if key in (ord("c"), ord("C")):
+                text = "\n".join(lines)
+                if copy_to_clipboard(text):
+                    self.toast("NOTES COPIED")
+                else:
+                    self.toast("CLIPBOARD FAILED")
+            elif key == curses.KEY_UP and cy > 0:
                 self.notes_cy -= 1
             elif key == curses.KEY_DOWN and cy < len(lines) - 1:
                 self.notes_cy += 1
@@ -768,11 +797,18 @@ class VaultApp:
         row += 1
 
         if self.cfg_mode == "menu":
-            opts = [("1","Change Master Password","change_pw"),("2","Change Vault Location","change_path")]
+            opts = [
+                ("1","Change Master Password","change_pw"),
+                ("2","Change Vault Location","change_path"),
+                ("3","Export All Credentials","export"),
+                ("4","Import Credentials File","import_file"),
+                ("5","Erase All Credentials","erase_all"),
+            ]
             for oi, (num, label, act) in enumerate(opts):
                 sel = oi == self.cfg_cursor
                 pref = "▸ " if sel else "  "
-                a = curses.color_pair(C_GREEN)|curses.A_BOLD if sel else curses.color_pair(C_GREEN)
+                c = C_RED if act == "erase_all" else C_GREEN
+                a = curses.color_pair(c)|curses.A_BOLD if sel else curses.color_pair(c)
                 self.s(row, x+2, pref, a)
                 self.s(row, x+4, f"[{num}] {label}", a)
                 self.zone(row, x+2, 1, w-4, act)
@@ -820,6 +856,136 @@ class VaultApp:
             self.zone(row, x+4, 1, 13, "cfg_path_save")
             self.s(row, x+22, "[ESC] Cancel", curses.color_pair(C_DIM))
             self.zone(row, x+22, 1, 12, "cfg_cancel")
+            if self.cfg_error:
+                self.s(row+2, x+4, f"⚠ {self.cfg_error}", curses.color_pair(C_RED)|curses.A_BOLD)
+
+        elif self.cfg_mode == "export":
+            self.s(row, x+2, "EXPORT ALL CREDENTIALS", curses.color_pair(C_YELLOW)|curses.A_BOLD)
+            row += 2
+            # Security warnings
+            warn_attr = curses.color_pair(C_RED)|curses.A_BOLD
+            warnings = [
+                "╔══════════════════════════════════════════════╗",
+                "║         ⚠  SECURITY WARNING  ⚠              ║",
+                "╠══════════════════════════════════════════════╣",
+                "║ This exports ALL credentials + passwords.   ║",
+                "║ Anyone with the export password can read     ║",
+                "║ EVERYTHING in your vault.                    ║",
+                "║                                              ║",
+                "║ If you lose the password, the exported file  ║",
+                "║ CANNOT be recovered. There is no reset.      ║",
+                "║                                              ║",
+                "║ DO NOT share this file over email, chat,     ║",
+                "║ or any insecure channel.                     ║",
+                "╚══════════════════════════════════════════════╝",
+            ]
+            for wl in warnings:
+                self.s(row, x+2, wl[:w-4], warn_attr)
+                row += 1
+            row += 1
+            for pi, (pl, pk) in enumerate(zip(["EXPORT PASSWORD","CONFIRM PASSWORD"], ["password","confirm"])):
+                active = pi == self.cfg_export_field
+                self.s(row, x+4, pl, curses.color_pair(C_GREEN) if active else curses.color_pair(C_DIM))
+                row += 1
+                val = self.cfg_export_fields.get(pk, "")
+                d = "•"*len(val) if val else "(empty)"
+                self.s(row, x+6, d[:w-12], curses.color_pair(C_GREEN) if val else curses.color_pair(C_DIM))
+                if active:
+                    cx = x+6+(len("•"*len(val)) if val else 0)
+                    if cx < x+w-2:
+                        self.s(row, cx, "█", curses.color_pair(C_GREEN)|curses.A_BOLD)
+                row += 2
+            out_path = str(Path.home() / "vault-invaders-export.enc")
+            self.s(row, x+4, f"Output: {out_path}"[:w-8], curses.color_pair(C_DIM))
+            row += 2
+            self.s(row, x+4, "[ENTER] Export", curses.color_pair(C_CYAN)|curses.A_BOLD)
+            self.s(row, x+22, "[ESC] Cancel", curses.color_pair(C_DIM))
+            if self.cfg_error:
+                self.s(row+2, x+4, f"⚠ {self.cfg_error}", curses.color_pair(C_RED)|curses.A_BOLD)
+
+        elif self.cfg_mode == "import_file":
+            self.s(row, x+2, "IMPORT CREDENTIALS FILE", curses.color_pair(C_YELLOW)|curses.A_BOLD)
+            row += 2
+            warn_attr = curses.color_pair(C_YELLOW)|curses.A_BOLD
+            warnings = [
+                "╔══════════════════════════════════════════════╗",
+                "║         ⚠  IMPORT WARNING  ⚠                ║",
+                "╠══════════════════════════════════════════════╣",
+                "║ Imported credentials will be ADDED to your  ║",
+                "║ vault. Duplicates will NOT be detected.      ║",
+                "║                                              ║",
+                "║ Only import files from TRUSTED sources.      ║",
+                "║ A tampered file could inject bad data.       ║",
+                "╚══════════════════════════════════════════════╝",
+            ]
+            for wl in warnings:
+                self.s(row, x+2, wl[:w-4], warn_attr)
+                row += 1
+            row += 1
+            if self.cfg_import_preview is not None:
+                count = len(self.cfg_import_preview)
+                self.s(row, x+4, f"Found {count} credentials. Import them?", curses.color_pair(C_GREEN)|curses.A_BOLD)
+                row += 2
+                self.s(row, x+4, "[Y] Confirm Import", curses.color_pair(C_CYAN)|curses.A_BOLD)
+                self.s(row, x+26, "[N] Cancel", curses.color_pair(C_DIM))
+            else:
+                fields = [("FILE PATH", "path"), ("IMPORT PASSWORD", "password")]
+                for pi, (pl, pk) in enumerate(fields):
+                    active = pi == self.cfg_import_field
+                    self.s(row, x+4, pl, curses.color_pair(C_GREEN) if active else curses.color_pair(C_DIM))
+                    row += 1
+                    val = self.cfg_import_fields.get(pk, "")
+                    if pk == "password":
+                        d = "•"*len(val) if val else "(empty)"
+                    else:
+                        d = val if val else "(empty)"
+                    self.s(row, x+6, d[:w-12], curses.color_pair(C_GREEN) if val else curses.color_pair(C_DIM))
+                    if active:
+                        cx = x+6+(len("•"*len(val)) if pk == "password" and val else len(val) if val else 0)
+                        if cx < x+w-2:
+                            self.s(row, cx, "█", curses.color_pair(C_GREEN)|curses.A_BOLD)
+                    row += 2
+                self.s(row, x+4, "[ENTER] Import", curses.color_pair(C_CYAN)|curses.A_BOLD)
+                self.s(row, x+22, "[ESC] Cancel", curses.color_pair(C_DIM))
+            if self.cfg_error:
+                self.s(row+2, x+4, f"⚠ {self.cfg_error}", curses.color_pair(C_RED)|curses.A_BOLD)
+
+        elif self.cfg_mode == "erase_all":
+            self.s(row, x+2, "ERASE ALL CREDENTIALS", curses.color_pair(C_RED)|curses.A_BOLD)
+            row += 2
+            warn_attr = curses.color_pair(C_RED)|curses.A_BOLD
+            warnings = [
+                "╔══════════════════════════════════════════════╗",
+                "║      ⚠  DANGER — IRREVERSIBLE ACTION  ⚠     ║",
+                "╠══════════════════════════════════════════════╣",
+                "║ This will PERMANENTLY DELETE every single    ║",
+                "║ credential stored in your vault.             ║",
+                "║                                              ║",
+                "║ There is NO undo. There is NO recovery.      ║",
+                "║ If you have not exported a backup, all       ║",
+                "║ passwords will be LOST FOREVER.              ║",
+                "║                                              ║",
+                "║ Enter your master password to confirm.       ║",
+                "╚══════════════════════════════════════════════╝",
+            ]
+            for wl in warnings:
+                self.s(row, x+2, wl[:w-4], warn_attr)
+                row += 1
+            row += 1
+            self.s(row, x+4, "MASTER PASSWORD", curses.color_pair(C_RED))
+            row += 1
+            val = self.cfg_erase_pw
+            d = "•"*len(val) if val else "(empty)"
+            self.s(row, x+6, d[:w-12], curses.color_pair(C_RED) if val else curses.color_pair(C_DIM))
+            cx = x+6+(len("•"*len(val)) if val else 0)
+            if cx < x+w-2:
+                self.s(row, cx, "█", curses.color_pair(C_RED)|curses.A_BOLD)
+            row += 2
+            count = len(self.entries)
+            self.s(row, x+4, f"This will destroy {count} credential{'s' if count != 1 else ''}.", curses.color_pair(C_RED))
+            row += 2
+            self.s(row, x+4, "[ENTER] Erase Everything", curses.color_pair(C_RED)|curses.A_BOLD)
+            self.s(row, x+32, "[ESC] Cancel", curses.color_pair(C_DIM))
             if self.cfg_error:
                 self.s(row+2, x+4, f"⚠ {self.cfg_error}", curses.color_pair(C_RED)|curses.A_BOLD)
 
@@ -948,13 +1114,14 @@ class VaultApp:
     def draw_help(self):
         h, w = self.scr.getmaxyx()
         helps = {
-            "tabs": " ←→:Switch Tab  ENTER/↓:Open  R:Refresh  Q:Quit  L:Lock ",
-            "list": " ↑↓:Navigate  ENTER:Detail  Type:Search  ESC:Tab Bar ",
-            "detail": " C:Copy User  P:Copy Pass  S:Show/Hide  E:Edit  X:Export  D:Delete  ESC:Back ",
+            "tabs": " ←→/Tab:Switch  ENTER/↓:Open  R:Refresh  Q:Quit  L:Lock ",
+            "list": "",
+            "detail": " C:Copy User  P:Copy Pass  S:Show/Hide  N:Notes  E:Edit  W:Dup  X:Export  D:Delete  ESC:Back ",
             "form": " TAB/↑↓:Fields  ENTER:Save  ESC:Back  ←→:Env ",
             "confirm_delete": ' Type "delete" + ENTER   ESC:Cancel ',
             "config": " ↑↓:Navigate  ENTER:Select  ESC:Tab Bar ",
             "import": " ENTER:Read Clipboard  Y:Confirm  N:Cancel  ESC:Tab Bar ",
+            "notes_editor": "",
         }
         ht = helps.get(self.mode, "")
         if self.mode == "config" and self.cfg_mode != "menu":
@@ -1100,6 +1267,8 @@ class VaultApp:
             self.confirm_input = ""; self.mode = "confirm_delete"
         elif key in (ord("x"), ord("X")):
             self._export_entry()
+        elif key in (ord("w"), ord("W")):
+            self._open_duplicate_form(e)
         elif key in (ord("n"), ord("N")):
             self._open_notes_editor(entry=e, readonly=True)
         elif key in (ord("b"), ord("B")):
@@ -1163,9 +1332,9 @@ class VaultApp:
             if key == curses.KEY_UP:
                 self.cfg_cursor = max(0, self.cfg_cursor-1)
             elif key == curses.KEY_DOWN:
-                self.cfg_cursor = min(1, self.cfg_cursor+1)
+                self.cfg_cursor = min(4, self.cfg_cursor+1)
             elif key == ord("\n"):
-                [self._open_change_pw, self._open_change_path][self.cfg_cursor]()
+                [self._open_change_pw, self._open_change_path, self._open_export, self._open_import_file, self._open_erase_all][self.cfg_cursor]()
             elif key == 27:
                 self.mode = "tabs"
             elif key in (ord("q"), ord("Q")):
@@ -1196,6 +1365,50 @@ class VaultApp:
                 self.cfg_path_input = self.cfg_path_input[:-1]
             elif 32 <= key < 127:
                 self.cfg_path_input += chr(key)
+        elif self.cfg_mode == "export":
+            if key == 27:
+                self.cfg_mode = "menu"; self.cfg_error = ""
+            elif key in (ord("\t"), curses.KEY_DOWN):
+                self.cfg_export_field = (self.cfg_export_field + 1) % 2
+            elif key == curses.KEY_UP:
+                self.cfg_export_field = (self.cfg_export_field - 1) % 2
+            elif key == ord("\n"):
+                self._apply_export()
+            else:
+                pk = ["password", "confirm"][self.cfg_export_field]
+                if key in (127, curses.KEY_BACKSPACE, 8):
+                    self.cfg_export_fields[pk] = self.cfg_export_fields[pk][:-1]
+                elif 32 <= key < 127:
+                    self.cfg_export_fields[pk] += chr(key)
+        elif self.cfg_mode == "erase_all":
+            if key == 27:
+                self.cfg_mode = "menu"; self.cfg_error = ""
+            elif key == ord("\n"):
+                self._apply_erase_all()
+            elif key in (127, curses.KEY_BACKSPACE, 8):
+                self.cfg_erase_pw = self.cfg_erase_pw[:-1]
+            elif 32 <= key < 127:
+                self.cfg_erase_pw += chr(key)
+        elif self.cfg_mode == "import_file":
+            if key == 27:
+                self.cfg_mode = "menu"; self.cfg_error = ""; self.cfg_import_preview = None
+            elif self.cfg_import_preview is not None:
+                if key in (ord("y"), ord("Y")):
+                    self._confirm_import_file()
+                elif key in (ord("n"), ord("N")):
+                    self.cfg_import_preview = None; self.cfg_error = ""
+            elif key in (ord("\t"), curses.KEY_DOWN):
+                self.cfg_import_field = (self.cfg_import_field + 1) % 2
+            elif key == curses.KEY_UP:
+                self.cfg_import_field = (self.cfg_import_field - 1) % 2
+            elif key == ord("\n"):
+                self._apply_import_file()
+            else:
+                pk = ["path", "password"][self.cfg_import_field]
+                if key in (127, curses.KEY_BACKSPACE, 8):
+                    self.cfg_import_fields[pk] = self.cfg_import_fields[pk][:-1]
+                elif 32 <= key < 127:
+                    self.cfg_import_fields[pk] += chr(key)
         return None
 
     # ── Input: import ─────────────────────────────────────────────
@@ -1237,6 +1450,12 @@ class VaultApp:
         self.form = {k: entry.get(k,"") for k in self.form_fields}
         self.form_field = 0; self._edit_id = id(entry); self._edit_ref = entry
         self.mode = "form"
+
+    def _open_duplicate_form(self, entry):
+        self.form = {k: entry.get(k,"") for k in self.form_fields}
+        self.form["notes"] = ""  # notes are never duplicated
+        self.form_field = 0; self._edit_id = None; self._edit_ref = None
+        self.mode = "form"; self.tab = 1
 
     def _close_form(self):
         self._edit_id = None; self._edit_ref = None
@@ -1340,6 +1559,95 @@ class VaultApp:
         self.cfg_mode = "menu"
         self.toast("VAULT RELOCATED")
 
+    def _open_erase_all(self):
+        self.cfg_mode = "erase_all"
+        self.cfg_erase_pw = ""
+        self.cfg_error = ""
+
+    def _apply_erase_all(self):
+        if not self.cfg_erase_pw:
+            self.cfg_error = "ENTER YOUR MASTER PASSWORD"; return
+        if self.cfg_erase_pw != self.master_pw:
+            self.cfg_error = "WRONG MASTER PASSWORD"; return
+        count = len(self.entries)
+        self.entries.clear()
+        save_vault(self.entries, self.master_pw)
+        self.cfg_erase_pw = ""
+        self.cfg_mode = "menu"
+        self.cfg_error = ""
+        self.cursor = 0
+        self.scroll = 0
+        self.toast(f"ERASED {count} CREDENTIALS")
+
+    def _open_export(self):
+        self.cfg_mode = "export"
+        self.cfg_export_fields = {"password": "", "confirm": ""}
+        self.cfg_export_field = 0
+        self.cfg_error = ""
+
+    def _apply_export(self):
+        pw = self.cfg_export_fields["password"]
+        confirm = self.cfg_export_fields["confirm"]
+        if len(pw) < 8:
+            self.cfg_error = "MIN 8 CHARACTERS"; return
+        if pw != confirm:
+            self.cfg_error = "PASSWORDS DON'T MATCH"; return
+        if not self.entries:
+            self.cfg_error = "NO CREDENTIALS TO EXPORT"; return
+        try:
+            encrypted = encrypt_vault(self.entries, pw)
+            out_path = Path.home() / "vault-invaders-export.enc"
+            out_path.write_bytes(b"VAULTEXP" + encrypted)
+            out_path.chmod(0o600)
+            count = len(self.entries)
+            self.cfg_mode = "menu"
+            self.cfg_error = ""
+            self.toast(f"EXPORTED {count} CREDENTIALS")
+        except Exception as e:
+            self.cfg_error = f"EXPORT FAILED: {e}"
+
+    def _open_import_file(self):
+        self.cfg_mode = "import_file"
+        self.cfg_import_fields = {"path": str(Path.home() / "vault-invaders-export.enc"), "password": ""}
+        self.cfg_import_field = 0
+        self.cfg_import_preview = None
+        self.cfg_error = ""
+
+    def _apply_import_file(self):
+        path_str = self.cfg_import_fields["path"].strip()
+        pw = self.cfg_import_fields["password"]
+        if not path_str:
+            self.cfg_error = "PATH CANNOT BE EMPTY"; return
+        if not pw:
+            self.cfg_error = "PASSWORD REQUIRED"; return
+        fpath = Path(os.path.expanduser(path_str)).resolve()
+        if not fpath.exists():
+            self.cfg_error = "FILE NOT FOUND"; return
+        try:
+            raw = fpath.read_bytes()
+        except Exception as e:
+            self.cfg_error = f"READ FAILED: {e}"; return
+        if not raw.startswith(b"VAULTEXP"):
+            self.cfg_error = "NOT A VALID EXPORT FILE"; return
+        try:
+            entries = decrypt_vault(raw[8:], pw)
+        except Exception:
+            self.cfg_error = "WRONG PASSWORD OR CORRUPTED FILE"; return
+        if not isinstance(entries, list):
+            self.cfg_error = "INVALID FILE CONTENT"; return
+        self.cfg_import_preview = entries
+        self.cfg_error = ""
+
+    def _confirm_import_file(self):
+        if self.cfg_import_preview:
+            count = len(self.cfg_import_preview)
+            self.entries.extend(self.cfg_import_preview)
+            save_vault(self.entries, self.master_pw)
+            self.cfg_import_preview = None
+            self.cfg_mode = "menu"
+            self.cfg_error = ""
+            self.toast(f"IMPORTED {count} CREDENTIALS")
+
     # ── Mouse ───────────────────────────────────────────────────────
     def handle_mouse(self, my, mx):
         for zy, zx, zh, zw, action, data in reversed(self.click_zones):
@@ -1380,6 +1688,9 @@ class VaultApp:
         elif action == "edit_entry":
             if items and self.cursor < len(items):
                 self._open_edit_form(items[self.cursor])
+        elif action == "dup_entry":
+            if items and self.cursor < len(items):
+                self._open_duplicate_form(items[self.cursor])
         elif action == "delete_entry":
             if items and self.cursor < len(items):
                 self.confirm_input = ""; self.mode = "confirm_delete"
@@ -1397,6 +1708,12 @@ class VaultApp:
             self._open_change_pw()
         elif action == "change_path":
             self._open_change_path()
+        elif action == "export":
+            self._open_export()
+        elif action == "import_file":
+            self._open_import_file()
+        elif action == "erase_all":
+            self._open_erase_all()
         elif action == "cfg_pw_field":
             self.cfg_pw_field = data
         elif action == "cfg_pw_save":
@@ -1432,7 +1749,10 @@ class VaultApp:
             except curses.error:
                 continue
             if key == -1:
+                if time.time() - self.last_activity >= self.inactivity_timeout:
+                    return "lock"
                 continue
+            self.last_activity = time.time()
             if key == curses.KEY_RESIZE:
                 h, w = self.scr.getmaxyx(); self.stars = Stars(h, w); continue
 
@@ -1677,6 +1997,7 @@ def login_screen(scr) -> tuple:
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 def main(scr):
+    curses.set_escdelay(25)
     curses.curs_set(0)
     init_colors()
     while True:
