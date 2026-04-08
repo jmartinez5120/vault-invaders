@@ -32,6 +32,8 @@ import subprocess
 import random
 import math
 import ctypes
+import secrets
+import string
 from pathlib import Path
 
 try:
@@ -286,29 +288,56 @@ LOGO = [
 ]
 TITLE_LINE = "▓▓ I N V A D E R S ▓▓"
 
-# ── Colors ──────────────────────────────────────────────────────────────
+# ── Colors & Themes ────────────────────────────────────────────────────
 C_GREEN, C_DIM, C_RED, C_YELLOW, C_CYAN = 1, 2, 3, 4, 5
 C_BG, C_SELECTED = 6, 7
 C_GREEN_INV, C_RED_INV, C_YELLOW_INV, C_CYAN_INV = 8, 9, 10, 11
 C_WHITE, C_STARS, C_MAGENTA = 12, 13, 14
 
-def init_colors():
+THEMES = {
+    "green": curses.COLOR_GREEN,
+    "blue": curses.COLOR_CYAN,
+    "amber": curses.COLOR_YELLOW,
+    "red": curses.COLOR_RED,
+}
+THEME_NAMES = list(THEMES.keys())
+
+def init_colors(theme="green"):
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(C_GREEN, curses.COLOR_GREEN, -1)
+    primary = THEMES.get(theme, curses.COLOR_GREEN)
+    curses.init_pair(C_GREEN, primary, -1)
     curses.init_pair(C_DIM, 8, -1)
     curses.init_pair(C_RED, curses.COLOR_RED, -1)
     curses.init_pair(C_YELLOW, curses.COLOR_YELLOW, -1)
     curses.init_pair(C_CYAN, curses.COLOR_CYAN, -1)
-    curses.init_pair(C_BG, curses.COLOR_GREEN, -1)
-    curses.init_pair(C_SELECTED, curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(C_GREEN_INV, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(C_BG, primary, -1)
+    curses.init_pair(C_SELECTED, curses.COLOR_BLACK, primary)
+    curses.init_pair(C_GREEN_INV, curses.COLOR_BLACK, primary)
     curses.init_pair(C_RED_INV, curses.COLOR_BLACK, curses.COLOR_RED)
     curses.init_pair(C_YELLOW_INV, curses.COLOR_BLACK, curses.COLOR_YELLOW)
     curses.init_pair(C_CYAN_INV, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(C_WHITE, curses.COLOR_WHITE, -1)
     curses.init_pair(C_STARS, curses.COLOR_WHITE, -1)
     curses.init_pair(C_MAGENTA, curses.COLOR_MAGENTA, -1)
+
+# ── Password Strength ─────────────────────────────────────────────────
+def _password_strength(pw):
+    """Returns (entropy_bits, label, color_pair)."""
+    if not pw:
+        return 0, "", C_DIM
+    pool = 0
+    if any(c.islower() for c in pw): pool += 26
+    if any(c.isupper() for c in pw): pool += 26
+    if any(c.isdigit() for c in pw): pool += 10
+    if any(not c.isalnum() for c in pw): pool += 32
+    if pool == 0: pool = 26
+    entropy = len(pw) * math.log2(pool)
+    if entropy < 30: return int(entropy), "WEAK", C_RED
+    if entropy < 50: return int(entropy), "FAIR", C_YELLOW
+    if entropy < 70: return int(entropy), "GOOD", C_CYAN
+    if entropy < 90: return int(entropy), "STRONG", C_GREEN
+    return int(entropy), "EXCELLENT", C_GREEN
 
 # ── Stars ───────────────────────────────────────────────────────────────
 class Stars:
@@ -331,6 +360,9 @@ class Stars:
 # TUI App
 # ═══════════════════════════════════════════════════════════════════════
 TABS = ["⌕ Credentials", "+ Add New", "📥 Import", "⚙ Config"]
+TAGS = ["WORK", "PERSONAL", "FINANCE", "SERVER", "SOCIAL"]
+TAG_COLORS = {"WORK": C_CYAN_INV, "PERSONAL": C_GREEN_INV, "FINANCE": C_YELLOW_INV,
+              "SERVER": C_RED_INV, "SOCIAL": C_MAGENTA}
 
 class VaultApp:
     def __init__(self, scr):
@@ -352,7 +384,16 @@ class VaultApp:
         self.show_pw = False
         self.form = {}
         self.form_field = 0
-        self.form_fields = ["system", "username", "password", "hostname", "port", "url", "description", "notes", "env"]
+        self.form_fields = ["system", "username", "password", "hostname", "port", "url", "description", "notes", "env", "tag"]
+        # Password generator state
+        self.pg_length = 16
+        self.pg_upper = True
+        self.pg_lower = True
+        self.pg_digits = True
+        self.pg_symbols = False
+        self.pg_result = ""
+        self._pg_return_mode = "form"
+        self._tag_custom_mode = False
         self.stars = None
         self.detail_cursor = 0
         self.confirm_input = ""
@@ -378,12 +419,23 @@ class VaultApp:
         self.cfg_import_field = 0
         self.cfg_import_preview = None
         self.cfg_erase_pw = ""
+        self._cfg_theme_choice = load_config().get("theme", "green")
         # Import state
         self.import_buffer = ""
         self.import_error = ""
         self.import_preview = None
 
     # ── Secure entry management ─────────────────────────────────────
+    @staticmethod
+    def _make_index(e):
+        return {
+            "system": e.get("system", ""),
+            "username": e.get("username", ""),
+            "env": e.get("env", "DEV"),
+            "favorite": e.get("favorite", False),
+            "tag": e.get("tag", ""),
+        }
+
     def _init_secure_storage(self, entries, master_pw):
         """Initialize encrypted per-entry storage from plaintext entries."""
         self.master_pw = master_pw
@@ -395,11 +447,7 @@ class VaultApp:
         for e in entries:
             blob = bytearray(encrypt_entry_fast(e, self._session_key))
             self._encrypted_entries.append(blob)
-            self._entry_index.append({
-                "system": e.get("system", ""),
-                "username": e.get("username", ""),
-                "env": e.get("env", "DEV"),
-            })
+            self._entry_index.append(self._make_index(e))
         self.entries = []  # clear plaintext
 
     def _decrypt_entry(self, idx):
@@ -414,11 +462,7 @@ class VaultApp:
         if idx < len(self._encrypted_entries):
             secure_zero(self._encrypted_entries[idx])
             self._encrypted_entries[idx] = blob
-            self._entry_index[idx] = {
-                "system": entry.get("system", ""),
-                "username": entry.get("username", ""),
-                "env": entry.get("env", "DEV"),
-            }
+            self._entry_index[idx] = self._make_index(entry)
         else:
             self._encrypted_entries.append(blob)
             self._entry_index.append({
@@ -486,11 +530,11 @@ class VaultApp:
         self.click_zones.append((y, x, h, w, action, data))
 
     def filtered(self):
-        """Returns list of (original_index, index_dict) tuples, sorted alphabetically."""
+        """Returns list of (original_index, index_dict) tuples. Favorites first, then alphabetical."""
         indexed = list(enumerate(self._entry_index))
         if self.search:
-            indexed = [(i, e) for i, e in indexed if fuzzy_match(self.search, e.get("system","")) or fuzzy_match(self.search, e.get("username",""))]
-        return sorted(indexed, key=lambda x: x[1].get("system", "").lower())
+            indexed = [(i, e) for i, e in indexed if fuzzy_match(self.search, e.get("system","")) or fuzzy_match(self.search, e.get("username","")) or fuzzy_match(self.search, e.get("tag",""))]
+        return sorted(indexed, key=lambda x: (not x[1].get("favorite", False), x[1].get("system", "").lower()))
 
     def draw_box(self, y, x, h, w, color=C_GREEN):
         cp = curses.color_pair(color)
@@ -614,12 +658,19 @@ class VaultApp:
                         self.scr.addstr(row+1, x + w - 1, "▌", border_c)
                     except curses.error:
                         pass
+                fav = "★ " if e.get("favorite") else ""
                 self.s(row, x+2, " ▸ ", sel_attr)
-                self.s(row, x+5, e.get("system","")[:w-18], sel_attr)
+                self.s(row, x+5, fav + e.get("system","")[:w-20], sel_attr)
                 self.s(row+1, x+2, " └ " + e.get("username","")[:w-12], sel_attr)
             else:
+                fav = "★ " if e.get("favorite") else ""
+                fc = curses.color_pair(C_YELLOW) if fav else curses.color_pair(C_DIM)
                 self.s(row, x, "  ", curses.color_pair(C_DIM))
-                self.s(row, x+2, e.get("system","")[:w-16], curses.color_pair(C_GREEN))
+                if fav:
+                    self.s(row, x+2, "★", curses.color_pair(C_YELLOW))
+                    self.s(row, x+4, e.get("system","")[:w-18], curses.color_pair(C_GREEN))
+                else:
+                    self.s(row, x+2, e.get("system","")[:w-16], curses.color_pair(C_GREEN))
                 self.s(row+1, x+2, "└ " + e.get("username","")[:w-10], curses.color_pair(C_DIM))
 
             # env badge
@@ -649,9 +700,16 @@ class VaultApp:
 
         self.s(y, x+2, "╔"+"═"*(w-6)+"╗", ec)
         self.s(y+1, x+2, "║", ec)
-        self.s(y+1, x+4, e.get("system","")[:w-12], curses.color_pair(C_GREEN)|curses.A_BOLD)
+        fav_str = "★ " if e.get("favorite") else ""
+        self.s(y+1, x+4, fav_str + e.get("system","")[:w-16], curses.color_pair(C_GREEN)|curses.A_BOLD)
+        # Tag + Env badges
+        bx_r = x+w-4
         badge = f" {env} "
-        self.s(y+1, x+w-len(badge)-5, badge, curses.color_pair(env_c.get(env, C_GREEN_INV)))
+        self.s(y+1, bx_r-len(badge)-1, badge, curses.color_pair(env_c.get(env, C_GREEN_INV)))
+        tag = e.get("tag", "")
+        if tag:
+            tbadge = f" {tag} "
+            self.s(y+1, bx_r-len(badge)-len(tbadge)-2, tbadge, curses.color_pair(TAG_COLORS.get(tag, C_WHITE)))
         self.s(y+1, x+w-4, "║", ec)
         self.s(y+2, x+2, "╚"+"═"*(w-6)+"╝", ec)
 
@@ -692,6 +750,11 @@ class VaultApp:
             val = e.get(key_name, "")
             if val or key_name == "notes":
                 self.s(row, x+2, label, curses.color_pair(C_DIM))
+                if key_name == "url":
+                    ub = "[U]rl Copy"
+                    ux = x + w - len(ub) - 3
+                    self.s(row, ux, ub, curses.color_pair(C_CYAN))
+                    self.zone(row, ux, 1, len(ub), "copy_url")
                 if key_name == "notes":
                     nb = "[N]otes"
                     nx = x + w - len(nb) - 3
@@ -735,7 +798,7 @@ class VaultApp:
 
         labels = {"system":"SYSTEM NAME *","username":"USERNAME *","password":"PASSWORD *",
                   "hostname":"HOSTNAME","port":"PORT","url":"URL",
-                  "description":"DESCRIPTION","notes":"NOTES","env":"ENVIRONMENT"}
+                  "description":"DESCRIPTION","notes":"NOTES","env":"ENVIRONMENT","tag":"TAG"}
 
         row = y + 5
         for fi, field in enumerate(self.form_fields):
@@ -754,6 +817,36 @@ class VaultApp:
                     ex += 8
                 if active:
                     self.s(row, ex+2, "← → to change", curses.color_pair(C_DIM))
+            elif field == "tag":
+                cur_tag = self.form.get("tag", "")
+                if self._tag_custom_mode and active:
+                    # Custom tag text input mode
+                    self.s(row, x+4, "Type tag: ", curses.color_pair(C_DIM))
+                    d = cur_tag if cur_tag else ""
+                    self.s(row, x+14, d[:w-18], curses.color_pair(C_GREEN))
+                    cx = x + 14 + len(d)
+                    if cx < x + w - 2:
+                        self.s(row, cx, "█", curses.color_pair(C_GREEN) | curses.A_BOLD)
+                    self.s(row + 1, x+4, "[ENTER] Accept  [ESC] Cancel", curses.color_pair(C_DIM))
+                    row += 1
+                else:
+                    ex = x + 4
+                    # None option
+                    a = curses.color_pair(C_GREEN_INV) | curses.A_BOLD if not cur_tag else curses.color_pair(C_DIM)
+                    self.s(row, ex, " NONE ", a)
+                    ex += 7
+                    # Predefined tags
+                    for tag in TAGS:
+                        a = curses.color_pair(TAG_COLORS.get(tag, C_WHITE)) if cur_tag == tag else curses.color_pair(C_DIM)
+                        padded = f" {tag} "
+                        self.s(row, ex, padded, a)
+                        self.zone(row, ex, 1, len(padded), "set_tag", tag)
+                        ex += len(padded) + 1
+                    if active:
+                        self.s(row, ex + 1, "← → or ENTER:Custom", curses.color_pair(C_DIM))
+                    # Show custom tag if set
+                    if cur_tag and cur_tag not in TAGS:
+                        self.s(row, x+4, f" {cur_tag} ", curses.color_pair(C_WHITE) | curses.A_BOLD)
             elif field == "notes":
                 val = self.form.get(field, "")
                 preview = val.replace("\n", " ")[:w-20] if val else "(empty)"
@@ -773,6 +866,17 @@ class VaultApp:
                     cx = x+4+(len("•"*len(val)) if field=="password" and val else len(val) if val else 0)
                     if cx < x+w-2:
                         self.s(row, cx, "█", curses.color_pair(C_GREEN)|curses.A_BOLD)
+                # Password strength meter
+                if field == "password" and val:
+                    bits, label, sc = _password_strength(val)
+                    bar_w = 16
+                    filled = min(bar_w, int(bar_w * min(bits, 100) / 100))
+                    bar = "█" * filled + "░" * (bar_w - filled)
+                    meter = f"[{bar}] {label} ({bits} bits)"
+                    row += 1
+                    self.s(row, x+4, meter, curses.color_pair(sc))
+                    if active:
+                        self.s(row, x + w - 10, "[G] Gen", curses.color_pair(C_CYAN))
             row += 2
         row += 1
         self.s(row, x+4, "[ENTER] Save", curses.color_pair(C_CYAN)|curses.A_BOLD)
@@ -926,6 +1030,103 @@ class VaultApp:
             lines[cy] = lines[cy][:cx] + chr(key) + lines[cy][cx:]
             self.notes_cx += 1
 
+    # ── Password generator popup ─────────────────────────────────────
+    def _open_password_gen(self, return_mode):
+        self._pg_return_mode = return_mode
+        self._generate_password()
+        self.mode = "password_gen"
+
+    def _generate_password(self):
+        charset = ""
+        if self.pg_upper: charset += string.ascii_uppercase
+        if self.pg_lower: charset += string.ascii_lowercase
+        if self.pg_digits: charset += string.digits
+        if self.pg_symbols: charset += "!@#$%^&*()-_=+[]{}|;:,.<>?"
+        if not charset: charset = string.ascii_lowercase
+        self.pg_result = "".join(secrets.choice(charset) for _ in range(self.pg_length))
+
+    def draw_password_gen(self):
+        h, w = self.scr.getmaxyx()
+        bw = min(w - 4, 52)
+        bh = 16
+        bx = w // 2 - bw // 2
+        by = h // 2 - bh // 2
+        for row in range(by, by + bh):
+            self.s(row, bx, " " * bw, curses.color_pair(C_GREEN))
+        self.draw_box(by, bx, bh, bw, C_GREEN)
+        title = " PASSWORD GENERATOR "
+        self.s(by, bx + bw // 2 - len(title) // 2, title, curses.color_pair(C_GREEN) | curses.A_BOLD)
+        r = by + 2
+        self.s(r, bx + 3, f"LENGTH:  ◄ {self.pg_length:2d} ►", curses.color_pair(C_GREEN) | curses.A_BOLD)
+        r += 2
+        opts = [
+            ("U", "Uppercase", self.pg_upper),
+            ("L", "Lowercase", self.pg_lower),
+            ("D", "Digits", self.pg_digits),
+            ("S", "Symbols", self.pg_symbols),
+        ]
+        col1 = bx + 3
+        col2 = bx + bw // 2 + 1
+        for i, (key, label, on) in enumerate(opts):
+            cx = col1 if i % 2 == 0 else col2
+            ry = r + (i // 2)
+            status = "ON " if on else "OFF"
+            sc = C_GREEN if on else C_RED
+            self.s(ry, cx, f"[{key}] {label:<10s} {status}", curses.color_pair(sc))
+        r += 3
+        self.s(r, bx + 3, "─" * (bw - 6), curses.color_pair(C_DIM))
+        r += 1
+        pw_display = self.pg_result[:bw - 6]
+        self.s(r, bx + 3, pw_display, curses.color_pair(C_GREEN) | curses.A_BOLD)
+        r += 1
+        self.s(r, bx + 3, "─" * (bw - 6), curses.color_pair(C_DIM))
+        r += 1
+        # Strength meter
+        bits, label, sc = _password_strength(self.pg_result)
+        bar_w = 16
+        filled = min(bar_w, int(bar_w * min(bits, 100) / 100))
+        bar = "█" * filled + "░" * (bar_w - filled)
+        self.s(r, bx + 3, f"[{bar}] {label} ({bits} bits)", curses.color_pair(sc))
+        r += 2
+        self.s(r, bx + 3, "[R] Regen", curses.color_pair(C_CYAN))
+        self.s(r, bx + 15, "[ENTER] Use", curses.color_pair(C_CYAN) | curses.A_BOLD)
+        self.s(r, bx + 29, "[ESC] Cancel", curses.color_pair(C_DIM))
+
+    def handle_password_gen_input(self, key):
+        if key == 27:
+            self.mode = self._pg_return_mode
+        elif key == ord("\n"):
+            if self._pg_return_mode == "form":
+                self.form["password"] = self.pg_result
+                self.toast("PASSWORD SET")
+            else:
+                if copy_to_clipboard(self.pg_result):
+                    clear_clipboard_after(15)
+                    self.toast("PASSWORD COPIED (15s)")
+                else:
+                    self.toast("CLIPBOARD FAILED")
+            self.mode = self._pg_return_mode
+        elif key == curses.KEY_LEFT:
+            self.pg_length = max(8, self.pg_length - 1)
+            self._generate_password()
+        elif key == curses.KEY_RIGHT:
+            self.pg_length = min(64, self.pg_length + 1)
+            self._generate_password()
+        elif key in (ord("u"), ord("U")):
+            self.pg_upper = not self.pg_upper
+            self._generate_password()
+        elif key in (ord("l"), ord("L")):
+            self.pg_lower = not self.pg_lower
+            self._generate_password()
+        elif key in (ord("d"), ord("D")):
+            self.pg_digits = not self.pg_digits
+            self._generate_password()
+        elif key in (ord("s"), ord("S")):
+            self.pg_symbols = not self.pg_symbols
+            self._generate_password()
+        elif key in (ord("r"), ord("R")):
+            self._generate_password()
+
     # ── Config screen ───────────────────────────────────────────────
     def draw_config(self, y, x, w):
         self.s(y, x + w//2 - 8, "⚙ CONFIGURATION", curses.color_pair(C_CYAN)|curses.A_BOLD)
@@ -956,6 +1157,7 @@ class VaultApp:
                 ("4","Import Credentials File","import_file"),
                 ("5","Erase All Credentials","erase_all"),
                 ("6","Auto-Lock Timer","auto_lock"),
+                ("7","Theme","theme"),
             ]
             for oi, (num, label, act) in enumerate(opts):
                 sel = oi == self.cfg_cursor
@@ -1167,6 +1369,29 @@ class VaultApp:
             self.s(row, x+20, "[ENTER] Save", curses.color_pair(C_CYAN)|curses.A_BOLD)
             self.s(row, x+36, "[ESC] Cancel", curses.color_pair(C_DIM))
 
+        elif self.cfg_mode == "theme":
+            self.s(row, x+2, "THEME", curses.color_pair(C_YELLOW)|curses.A_BOLD)
+            row += 2
+            self.s(row, x+4, "Choose your terminal color scheme:", curses.color_pair(C_DIM))
+            row += 2
+            current_theme = load_config().get("theme", "green")
+            ox = x + 4
+            for name in THEME_NAMES:
+                is_sel = self._cfg_theme_choice == name
+                if is_sel:
+                    attr = curses.color_pair(C_GREEN_INV) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(C_DIM)
+                padded = f" {name.upper()} "
+                self.s(row, ox, padded, attr)
+                ox += len(padded) + 2
+            row += 2
+            self.s(row, x+4, f"Current: {current_theme.upper()}", curses.color_pair(C_GREEN))
+            row += 2
+            self.s(row, x+4, "[←→] Change", curses.color_pair(C_CYAN))
+            self.s(row, x+20, "[ENTER] Apply", curses.color_pair(C_CYAN)|curses.A_BOLD)
+            self.s(row, x+36, "[ESC] Cancel", curses.color_pair(C_DIM))
+
     # ── Import screen ─────────────────────────────────────────────
     def draw_import(self, y, x, w):
         self.s(y, x + w//2 - 10, "📥 IMPORT CREDENTIALS", curses.color_pair(C_CYAN)|curses.A_BOLD)
@@ -1295,7 +1520,7 @@ class VaultApp:
         helps = {
             "tabs": " ←→/Tab:Switch  ENTER/↓:Open  R:Refresh  Q:Quit  L:Lock ",
             "list": "",
-            "detail": " C:Copy User  P:Copy Pass  S:Show/Hide  N:Notes  E:Edit  W:Dup  X:Export  D:Delete  ESC:Back ",
+            "detail": " C:User P:Pass U:URL S:Show F:Fav G:Gen N:Notes E:Edit W:Dup X:Export D:Del ESC:Back ",
             "form": " TAB/↑↓:Fields  ENTER:Save  ESC:Back  ←→:Env ",
             "confirm_delete": ' Type "delete" + ENTER   ESC:Cancel ',
             "config": " ↑↓:Navigate  ENTER:Select  ESC:Tab Bar ",
@@ -1364,6 +1589,8 @@ class VaultApp:
             self.draw_confirm()
         if self.mode == "notes_editor":
             self.draw_notes_editor()
+        if self.mode == "password_gen":
+            self.draw_password_gen()
         self.draw_help()
         self.scr.refresh()
 
@@ -1449,6 +1676,19 @@ class VaultApp:
             self._export_entry()
         elif key in (ord("w"), ord("W")):
             self._open_duplicate_form(e)
+        elif key in (ord("g"), ord("G")):
+            self._open_password_gen("detail")
+        elif key in (ord("f"), ord("F")):
+            e["favorite"] = not e.get("favorite", False)
+            self._encrypt_and_store(orig_idx, e)
+            self._save_vault_from_secure()
+            self.toast("★ FAVORITED" if e["favorite"] else "☆ UNFAVORITED")
+        elif key in (ord("u"), ord("U")):
+            url = e.get("url", "")
+            if url:
+                self.toast("URL COPIED" if copy_to_clipboard(url) else "CLIPBOARD FAILED")
+            else:
+                self.toast("NO URL SET")
         elif key in (ord("n"), ord("N")):
             self._open_notes_editor(entry=e, readonly=True, orig_idx=orig_idx)
         elif key in (ord("b"), ord("B")):
@@ -1471,12 +1711,44 @@ class VaultApp:
         elif key == curses.KEY_RIGHT and field == "env":
             envs = ["DEV","TEST","PROD"]
             self.form["env"] = envs[(envs.index(self.form.get("env","DEV"))+1)%3]
+        elif key == curses.KEY_LEFT and field == "tag" and not self._tag_custom_mode:
+            cur = self.form.get("tag", "")
+            # Cycle: NONE → predefined tags → CUSTOM
+            all_opts = [""] + TAGS
+            try: ci = all_opts.index(cur)
+            except ValueError: ci = 0
+            ci = (ci - 1) % len(all_opts)
+            self.form["tag"] = all_opts[ci]
+        elif key == curses.KEY_RIGHT and field == "tag" and not self._tag_custom_mode:
+            cur = self.form.get("tag", "")
+            all_opts = [""] + TAGS
+            try: ci = all_opts.index(cur)
+            except ValueError: ci = 0
+            ci = (ci + 1) % len(all_opts)
+            self.form["tag"] = all_opts[ci]
+        elif key in (ord("g"), ord("G")) and field == "password":
+            self._open_password_gen("form")
+        elif key == ord("\n") and field == "tag" and not self._tag_custom_mode:
+            # Enter on tag field activates custom mode
+            self._tag_custom_mode = True
+            self.form["tag"] = ""
         elif key == ord("\n"):
+            if field == "tag" and self._tag_custom_mode:
+                self._tag_custom_mode = False  # Accept custom tag
+                return None
             if field == "notes":
                 self._open_notes_editor()
                 return None
             self._save_form()
-        elif field != "env" and field != "notes":
+        elif field == "tag" and self._tag_custom_mode:
+            if key == 27:
+                self._tag_custom_mode = False
+                self.form["tag"] = ""
+            elif key in (127, curses.KEY_BACKSPACE, 8):
+                self.form["tag"] = self.form.get("tag", "")[:-1]
+            elif 32 <= key < 127:
+                self.form["tag"] = (self.form.get("tag", "") + chr(key).upper())[:20]
+        elif field not in ("env", "notes", "tag"):
             if key in (127, curses.KEY_BACKSPACE, 8):
                 self.form[field] = self.form.get(field,"")[:-1]
             elif 32 <= key < 127:
@@ -1510,9 +1782,9 @@ class VaultApp:
             if key == curses.KEY_UP:
                 self.cfg_cursor = max(0, self.cfg_cursor-1)
             elif key == curses.KEY_DOWN:
-                self.cfg_cursor = min(5, self.cfg_cursor+1)
+                self.cfg_cursor = min(6, self.cfg_cursor+1)
             elif key == ord("\n"):
-                [self._open_change_pw, self._open_change_path, self._open_export, self._open_import_file, self._open_erase_all, self._open_auto_lock][self.cfg_cursor]()
+                [self._open_change_pw, self._open_change_path, self._open_export, self._open_import_file, self._open_erase_all, self._open_auto_lock, self._open_theme][self.cfg_cursor]()
             elif key == 27:
                 self.mode = "tabs"
             elif key in (ord("q"), ord("Q")):
@@ -1558,6 +1830,20 @@ class VaultApp:
                     self.cfg_export_fields[pk] = self.cfg_export_fields[pk][:-1]
                 elif 32 <= key < 127:
                     self.cfg_export_fields[pk] += chr(key)
+        elif self.cfg_mode == "theme":
+            if key == 27:
+                self._cfg_theme_choice = load_config().get("theme", "green")
+                self.cfg_mode = "menu"
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                try: ci = THEME_NAMES.index(self._cfg_theme_choice)
+                except ValueError: ci = 0
+                if key == curses.KEY_RIGHT:
+                    ci = (ci + 1) % len(THEME_NAMES)
+                else:
+                    ci = (ci - 1) % len(THEME_NAMES)
+                self._cfg_theme_choice = THEME_NAMES[ci]
+            elif key == ord("\n"):
+                self._apply_theme()
         elif self.cfg_mode == "auto_lock":
             if key == 27:
                 self.cfg_mode = "menu"
@@ -1636,7 +1922,7 @@ class VaultApp:
             self.toast(f"RELOAD FAILED: {e}"[:40])
 
     def _open_add_form(self):
-        self.form = {"system":"","username":"","password":"","hostname":"","port":"","url":"","description":"","notes":"","env":"DEV"}
+        self.form = {"system":"","username":"","password":"","hostname":"","port":"","url":"","description":"","notes":"","env":"DEV","tag":""}
         self.form_field = 0; self._edit_idx = None
         self.mode = "form"; self.tab = 1
 
@@ -1771,6 +2057,18 @@ class VaultApp:
         mins = self.inactivity_timeout // 60
         self.toast(f"AUTO-LOCK SET TO {mins} MIN")
 
+    def _open_theme(self):
+        self._cfg_theme_choice = load_config().get("theme", "green")
+        self.cfg_mode = "theme"
+
+    def _apply_theme(self):
+        cfg = load_config()
+        cfg["theme"] = self._cfg_theme_choice
+        save_config(cfg)
+        init_colors(self._cfg_theme_choice)
+        self.cfg_mode = "menu"
+        self.toast(f"THEME: {self._cfg_theme_choice.upper()}")
+
     def _open_erase_all(self):
         self.cfg_mode = "erase_all"
         self.cfg_erase_pw = ""
@@ -1903,6 +2201,17 @@ class VaultApp:
                     self.toast("CLIPBOARD FAILED")
         elif action == "toggle_pw":
             self.show_pw = not self.show_pw
+        elif action == "copy_url":
+            if items and self.cursor < len(items):
+                oidx, _ = items[self.cursor]
+                de = self._decrypt_entry(oidx)
+                url = de.get("url", "")
+                self.toast("URL COPIED" if url and copy_to_clipboard(url) else "NO URL SET")
+        elif action == "set_tag":
+            self.form["tag"] = data
+        elif action == "set_tag_custom":
+            self.form["tag"] = ""
+            self.form_field = self.form_fields.index("tag")
         elif action == "open_notes":
             if items and self.cursor < len(items):
                 oidx, _ = items[self.cursor]
@@ -1943,6 +2252,8 @@ class VaultApp:
             self._open_erase_all()
         elif action == "auto_lock":
             self._open_auto_lock()
+        elif action == "theme":
+            self._open_theme()
         elif action == "set_auto_lock":
             self.inactivity_timeout = data
         elif action == "cfg_pw_field":
@@ -2002,11 +2313,11 @@ class VaultApp:
                             self.cursor = min(len(its)-1, self.cursor+1) if its else 0
                 except curses.error:
                     pass
-            elif key == ord("\t") and self.mode != "form" and self.mode != "notes_editor":
+            elif key == ord("\t") and self.mode not in ("form", "notes_editor", "password_gen"):
                 self.tab = (self.tab + 1) % len(TABS)
                 self.mode = "tabs"
                 self.search = ""
-            elif key == curses.KEY_BTAB and self.mode != "form" and self.mode != "notes_editor":
+            elif key == curses.KEY_BTAB and self.mode not in ("form", "notes_editor", "password_gen"):
                 self.tab = (self.tab - 1) % len(TABS)
                 self.mode = "tabs"
                 self.search = ""
@@ -2026,6 +2337,8 @@ class VaultApp:
                 result = self.handle_import_input(key)
             elif self.mode == "notes_editor":
                 self.handle_notes_editor_input(key)
+            elif self.mode == "password_gen":
+                self.handle_password_gen_input(key)
 
             if result == "quit":
                 break
@@ -2038,7 +2351,7 @@ class VaultApp:
 # Login Screen
 # ═══════════════════════════════════════════════════════════════════════
 def login_screen(scr) -> tuple:
-    init_colors()
+    init_colors(load_config().get("theme", "green"))
     curses.curs_set(0)
     scr.timeout(150)
     h, w = scr.getmaxyx()
@@ -2230,8 +2543,10 @@ def login_screen(scr) -> tuple:
 def main(scr):
     curses.set_escdelay(25)
     curses.curs_set(0)
-    init_colors()
     while True:
+        init_colors(load_config().get("theme", "green"))
+        scr.clear()
+        scr.refresh()
         try:
             master_pw, entries = login_screen(scr)
         except SystemExit:
