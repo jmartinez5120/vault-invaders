@@ -857,13 +857,16 @@ class VaultApp:
                     self.s(row, x + w - len(hint) - 2, hint, curses.color_pair(C_CYAN))
             else:
                 val = self.form.get(field, "")
-                if field == "password" and val:
+                reveal = field == "password" and self.show_pw
+                if field == "password" and val and not reveal:
                     d = "•"*len(val)
                 else:
                     d = val if val else "(empty)"
                 self.s(row, x+4, d[:w-8], curses.color_pair(C_GREEN) if val else curses.color_pair(C_DIM))
                 if active:
-                    cx = x+4+(len("•"*len(val)) if field=="password" and val else len(val) if val else 0)
+                    cx = x+4+(len(val) if (reveal or field != "password") else (len("•"*len(val)) if val else 0))
+                    if not val:
+                        cx = x+4
                     if cx < x+w-2:
                         self.s(row, cx, "█", curses.color_pair(C_GREEN)|curses.A_BOLD)
                 # Password strength meter
@@ -876,7 +879,11 @@ class VaultApp:
                     row += 1
                     self.s(row, x+4, meter, curses.color_pair(sc))
                     if active:
-                        self.s(row, x + w - 10, "[G] Gen", curses.color_pair(C_CYAN))
+                        hint = "[^G]Gen [^T]" + ("Hide" if self.show_pw else "Show")
+                        self.s(row, x + w - len(hint) - 2, hint, curses.color_pair(C_CYAN))
+                elif field == "password" and active:
+                    hint = "[^G]Gen [^T]" + ("Hide" if self.show_pw else "Show")
+                    self.s(row, x + w - len(hint) - 2, hint, curses.color_pair(C_CYAN))
             row += 2
         row += 1
         self.s(row, x+4, "[ENTER] Save", curses.color_pair(C_CYAN)|curses.A_BOLD)
@@ -1726,8 +1733,10 @@ class VaultApp:
             except ValueError: ci = 0
             ci = (ci + 1) % len(all_opts)
             self.form["tag"] = all_opts[ci]
-        elif key in (ord("g"), ord("G")) and field == "password":
+        elif key == 7 and field == "password":  # Ctrl+G
             self._open_password_gen("form")
+        elif key == 20 and field == "password":  # Ctrl+T toggle show/hide
+            self.show_pw = not self.show_pw
         elif key == ord("\n") and field == "tag" and not self._tag_custom_mode:
             # Enter on tag field activates custom mode
             self._tag_custom_mode = True
@@ -1924,21 +1933,25 @@ class VaultApp:
     def _open_add_form(self):
         self.form = {"system":"","username":"","password":"","hostname":"","port":"","url":"","description":"","notes":"","env":"DEV","tag":""}
         self.form_field = 0; self._edit_idx = None
+        self.show_pw = False
         self.mode = "form"; self.tab = 1
 
     def _open_edit_form(self, entry, orig_idx=None):
         self.form = {k: entry.get(k,"") for k in self.form_fields}
         self.form_field = 0; self._edit_idx = orig_idx
+        self.show_pw = False
         self.mode = "form"
 
     def _open_duplicate_form(self, entry):
         self.form = {k: entry.get(k,"") for k in self.form_fields}
         self.form["notes"] = ""  # notes are never duplicated
         self.form_field = 0; self._edit_idx = None
+        self.show_pw = False
         self.mode = "form"; self.tab = 1
 
     def _close_form(self):
         self._edit_idx = None
+        self.show_pw = False
         self.tab = 0
         self.mode = "list"
 

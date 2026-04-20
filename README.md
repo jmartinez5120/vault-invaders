@@ -92,6 +92,11 @@ Run `invade` (or `python3 vault_invaders.py`) to launch. On first run you'll cre
 - **L** - Lock vault
 - **Q** - Quit
 
+While editing the password field in the add/edit form:
+
+- **Ctrl+G** - Open password generator
+- **Ctrl+T** - Toggle show/hide the password you're typing
+
 ## License
 
 MIT
